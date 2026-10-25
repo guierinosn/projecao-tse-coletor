@@ -85,7 +85,57 @@ app.get("/api/status", (req, res) => {
   });
 });
 
+
 app.get("/api/municipios", async (req, res) => {
+  try {
+    const config = await obterConfiguracao();
+    const mapa = new Map();
+
+    for (const estado of config.abr) {
+      const uf = String(estado.cd || "").trim().toLowerCase();
+
+      for (const municipio of estado.mu || []) {
+        const codigo = normalizarCodigo(municipio.cd);
+
+        if (!/^[a-z]{2}$/.test(uf) || !/^\d{5}$/.test(codigo)) {
+          continue;
+        }
+
+        const chave = `${uf}-${codigo}`;
+
+        mapa.set(chave, {
+          uf,
+          codigo,
+          codigoIBGE: String(municipio.cdi || "").trim() || null,
+          nome: String(municipio.nm || "").trim(),
+          capital: municipio.c === "s",
+          zonas: municipio.z || []
+        });
+      }
+    }
+
+    const municipios = [...mapa.values()].sort(
+      (a, b) =>
+        a.uf.localeCompare(b.uf) ||
+        a.nome.localeCompare(b.nome, "pt-BR")
+    );
+
+    res.json({
+      ok: true,
+      fonte: "TSE",
+      atualizadoEm: new Date().toISOString(),
+      totalMunicipios: municipios.length,
+      municipios
+    });
+  } catch (erro) {
+    res.status(502).json({
+      ok: false,
+      erro: String(erro),
+      consultadoEm: new Date().toISOString()
+    });
+  }
+});
+
   try {
     const config = await obterConfiguracao();
     const municipios = [];
