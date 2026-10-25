@@ -1,4 +1,3 @@
-
 import express from "express";
 
 const app = express();
@@ -9,6 +8,9 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -46,9 +48,6 @@ const URL_NACIONAL_ACOMP =
 const URL_NACIONAL_PRESIDENTE =
   `${BASE}/dados/br/br-c0001-e${ELEICAO_ARQ}-u.json`;
 
-// Totalização presidencial do exterior (abrangência ZZ).
-// É usada apenas na projeção baseada em localidades; o arquivo BR oficial
-// já agrega o exterior e não deve receber esta soma novamente.
 const URL_EXTERIOR_PRESIDENTE =
   `${BASE}/dados/zz/zz-c0001-e${ELEICAO_ARQ}-u.json`;
 
@@ -69,7 +68,6 @@ const CACHE_MS = 25000;
 const MUNICIPIO_CACHE_MS = 300000;
 const EXTERIOR_CACHE_MS = 60000;
 
-// As credenciais ficam somente nas variáveis privadas do Render.
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY || "";
@@ -126,7 +124,6 @@ async function gravarSnapshot(dados) {
   const candidatosOficiais =
     dados.candidatosOficiais || dados.brasil?.candidatosOficiais || [];
 
-  // Não grava snapshots idênticos consecutivos.
   const assinatura = JSON.stringify({
     eleicao: dados.eleicao,
     oficial: oficial ? {
@@ -190,7 +187,6 @@ async function obterResultadoExterior() {
       arquivo: URL_EXTERIOR_PRESIDENTE
     };
 
-    // Só aceitamos a resposta se ela tiver a estrutura esperada.
     if (!result.eleitoradoApto && !result.secoesTotal && !result.candidatos.length) {
       throw new Error("O arquivo ZZ não contém estatísticas reconhecíveis.");
     }
@@ -202,7 +198,6 @@ async function obterResultadoExterior() {
   } catch (e) {
     cache.exteriorError = e.message || String(e);
     console.error("Falha ao consultar totalização presidencial do exterior:", cache.exteriorError);
-    // Se já houve uma resposta válida, mantém o último valor enquanto a fonte falha.
     return cache.exterior || null;
   }
 }
@@ -214,14 +209,14 @@ async function obterProjecaoAtual() {
     .map(m => cache.municipalities.get(`${m.uf}/${m.codigo}`)?.data)
     .filter(Boolean);
 
-  // ZZ não é município brasileiro. É uma localidade separada, incluída
-  // apenas na projeção presidencial quando o arquivo oficial estiver disponível.
   const exterior = await obterResultadoExterior();
   const rowsParaProjecao = exterior ? [...rows, exterior] : rows;
+
   const estadosProjetados = UFS.map(uf => {
     const municipaisUf = rows.filter(m => m.uf === uf);
     const municipiosUf = c.municipios.filter(m => m.uf === uf);
     const resumo = projetarMunicipios(municipaisUf, municipiosUf.length);
+
     return {
       uf,
       estado: NOMES_UF[uf] || uf.toUpperCase(),
@@ -234,6 +229,7 @@ async function obterProjecaoAtual() {
       candidatos: resumo.candidatos
     };
   });
+
   const projecao = projetarMunicipios(rowsParaProjecao, c.municipios.length);
   projecao.estadosProjetados = estadosProjetados;
 
@@ -271,10 +267,7 @@ async function cicloHistorico() {
     });
 
     if (resultado.salvo) {
-      console.log(
-        "Snapshot do histórico gravado:",
-        resultado.registradoEm
-      );
+      console.log("Snapshot do histórico gravado:", resultado.registradoEm);
     }
   } catch (e) {
     historicoUltimoErro = e.message || String(e);
@@ -553,9 +546,8 @@ async function atualizarCacheMunicipal() {
 }
 
 function projetarMunicipios(rows, totalConfigurado = rows.length) {
-  // A projeção usa votos observados por eleitorado das seções já totalizadas.
-  // Seções/urnas nunca entram na fórmula de cobertura de votos.
   const usable = rows.filter(m => m && m.eleitoradoApto > 0);
+
   const observed = usable.filter(m =>
     m.eleitoradoTotalizado > 0 &&
     (m.votosValidos + m.votosBrancos + m.votosNulos) > 0
@@ -568,28 +560,49 @@ function projetarMunicipios(rows, totalConfigurado = rows.length) {
     const white = list.reduce((s,m)=>s + Math.max(0,m.votosBrancos||0),0);
     const nul = list.reduce((s,m)=>s + Math.max(0,m.votosNulos||0),0);
     const candidateVotes = new Map();
-    for (const m of list) for (const c of (m.candidatos||[])) {
-      const key = c.numero || c.nome;
-      const old = candidateVotes.get(key) || {numero:c.numero,nome:c.nome,partido:c.partido,votos:0};
-      old.votos += Math.max(0,c.votos||0);
-      candidateVotes.set(key,old);
+
+    for (const m of list) {
+      for (const c of (m.candidatos||[])) {
+        const key = c.numero || c.nome;
+        const old = candidateVotes.get(key) || {
+          numero:c.numero,
+          nome:c.nome,
+          partido:c.partido,
+          votos:0
+        };
+
+        old.votos += Math.max(0,c.votos||0);
+        candidateVotes.set(key,old);
+      }
     }
-    const candTotal = [...candidateVotes.values()].reduce((s,c)=>s+c.votos,0);
+
+    const candTotal = [...candidateVotes.values()]
+      .reduce((s,c)=>s+c.votos,0);
+
     return {
-      electorate, ballots, valid, white, nul,
+      electorate,
+      ballots,
+      valid,
+      white,
+      nul,
       turnout: electorate > 0 ? Math.min(1,ballots/electorate) : null,
       validShare: ballots > 0 ? valid/ballots : null,
       whiteShare: ballots > 0 ? white/ballots : null,
       nullShare: ballots > 0 ? nul/ballots : null,
       candidateShares: new Map([...candidateVotes].map(([k,c])=>[k,{
-        ...c, share: candTotal>0?c.votos/candTotal:0
+        ...c,
+        share: candTotal>0 ? c.votos/candTotal : 0
       }]))
     };
   };
 
   const nationalObserved = aggregate(observed);
   const byUf = new Map();
-  for (const uf of UFS) byUf.set(uf, aggregate(observed.filter(m=>m.uf===uf)));
+
+  for (const uf of UFS) {
+    byUf.set(uf, aggregate(observed.filter(m=>m.uf===uf)));
+  }
+
   const fallbackTurnout = nationalObserved.turnout;
   const fallbackValid = nationalObserved.validShare;
   const fallbackWhite = nationalObserved.whiteShare;
@@ -611,14 +624,18 @@ function projetarMunicipios(rows, totalConfigurado = rows.length) {
     const white = Math.max(0,m.votosBrancos||0);
     const nul = Math.max(0,m.votosNulos||0);
     const ballots = valid + white + nul;
+
     eligible += apto;
     electorateWithResults += eTotalizado;
     totalSections += Math.max(0,m.secoesTotal||0);
     countedSections += Math.max(0,m.secoesTotalizadas||0);
-    officialValid += valid; officialWhite += white; officialNull += nul;
+    officialValid += valid;
+    officialWhite += white;
+    officialNull += nul;
     observedBallots += ballots;
 
     const hasLocal = eTotalizado > 0 && ballots > 0 && (m.candidatos||[]).length > 0;
+
     if (hasLocal) {
       if (m.uf === 'zz') exteriorComDados = true;
       else municipalitiesWithVotes++;
@@ -628,29 +645,37 @@ function projetarMunicipios(rows, totalConfigurado = rows.length) {
     const turnout = hasLocal
       ? Math.min(1, ballots / eTotalizado)
       : (ufStats?.turnout ?? fallbackTurnout);
+
     const validShare = hasLocal
       ? (ballots > 0 ? valid / ballots : fallbackValid)
       : (ufStats?.validShare ?? fallbackValid);
+
     const whiteShare = hasLocal
       ? (ballots > 0 ? white / ballots : fallbackWhite)
       : (ufStats?.whiteShare ?? fallbackWhite);
+
     const nullShare = hasLocal
       ? (ballots > 0 ? nul / ballots : fallbackNull)
       : (ufStats?.nullShare ?? fallbackNull);
+
     const candidateShares = hasLocal
       ? new Map((m.candidatos||[]).map(c=>[c.numero||c.nome,{
-          numero:c.numero,nome:c.nome,partido:c.partido,
+          numero:c.numero,
+          nome:c.nome,
+          partido:c.partido,
           share:(m.candidatos||[]).reduce((sum,x)=>sum+Math.max(0,x.votos||0),0)>0
-            ? Math.max(0,c.votos||0)/(m.candidatos||[]).reduce((sum,x)=>sum+Math.max(0,x.votos||0),0) : 0
+            ? Math.max(0,c.votos||0)/(m.candidatos||[]).reduce((sum,x)=>sum+Math.max(0,x.votos||0),0)
+            : 0
         }]))
       : ((ufStats?.candidateShares?.size ? ufStats.candidateShares : fallbackCandidates) || new Map());
 
-    // Se ainda não há qualquer resultado no país, não há base estatística para projetar.
     if (turnout === null || validShare === null || !candidateShares.size) continue;
+
     const ballotsFinal = apto * turnout;
     const validFinal = ballotsFinal * validShare;
     const whiteFinal = ballotsFinal * (whiteShare ?? 0);
     const nullFinal = ballotsFinal * (nullShare ?? 0);
+
     projectedBallots += ballotsFinal;
     projectedValid += validFinal;
     projectedWhite += whiteFinal;
@@ -659,30 +684,44 @@ function projetarMunicipios(rows, totalConfigurado = rows.length) {
 
     for (const [key,share] of candidateShares) {
       const old = byCandidate.get(key) || {
-        numero:share.numero, nome:share.nome, partido:share.partido,
-        votosOficiais:0, votosProjetados:0
+        numero:share.numero,
+        nome:share.nome,
+        partido:share.partido,
+        votosOficiais:0,
+        votosProjetados:0
       };
-      const localCandidate = (m.candidatos||[]).find(c=>(c.numero||c.nome)===key);
-      if (localCandidate) old.votosOficiais += Math.max(0,localCandidate.votos||0);
+
+      const localCandidate = (m.candidatos||[])
+        .find(c=>(c.numero||c.nome)===key);
+
+      if (localCandidate) {
+        old.votosOficiais += Math.max(0,localCandidate.votos||0);
+      }
+
       old.votosProjetados += validFinal * Math.max(0,share.share||0);
       byCandidate.set(key,old);
     }
   }
 
-  const candidates = [...byCandidate.values()].sort((a,b)=>b.votosProjetados-a.votosProjetados);
+  const candidates = [...byCandidate.values()]
+    .sort((a,b)=>b.votosProjetados-a.votosProjetados);
+
   const candidateTotal = candidates.reduce((s,c)=>s+c.votosProjetados,0);
-  for (const c of candidates) c.percentualProjetado = pct(c.votosProjetados,candidateTotal);
+
+  for (const c of candidates) {
+    c.percentualProjetado = pct(c.votosProjetados,candidateTotal);
+  }
 
   return {
     eleitoradoApto: eligible,
     eleitoradoTotalizado: electorateWithResults,
-    apuracaoEleitoradoPct: pct(electorateWithResults,eligible), // informativo; não é avanço da projeção
+    apuracaoEleitoradoPct: pct(electorateWithResults,eligible),
     votosApurados: observedBallots,
     votosFinaisProjetados: projectedBallots,
     apuracaoVotosPct: projectedBallots > 0 ? Math.min(100,pct(observedBallots,projectedBallots)) : null,
     secoesTotal: totalSections,
     secoesTotalizadas: countedSections,
-    apuracaoSecoesPct: pct(countedSections,totalSections), // apenas diagnóstico operacional
+    apuracaoSecoesPct: pct(countedSections,totalSections),
     votosValidosOficiais: officialValid,
     votosBrancosOficiais: officialWhite,
     votosNulosOficiais: officialNull,
@@ -875,7 +914,7 @@ app.get("/api/brasil", async (_req, res, next) => {
     const data = await obterBrasil();
 
     if (!cache.refreshStarted && cache.municipalities.size === 0) {
-      atualizarCacheMunicipal();
+      void atualizarCacheMunicipal();
     }
 
     res.json(data);
@@ -936,13 +975,13 @@ app.get("/api/municipio/:uf/:codigo", async (req, res, next) => {
 
 app.get("/api/projecao", async (_req, res, next) => {
   try {
-    const c = await obterConfiguracao();
+    await obterConfiguracao();
 
-    if (
-      !cache.refreshStarted &&
-      cache.municipalities.size < c.municipios.length
-    ) {
-      atualizarCacheMunicipal();
+    // Dispara uma nova varredura mesmo quando o Map já contém
+    // todos os municípios. Os registros válidos por 5 minutos
+    // são reutilizados; os vencidos são consultados novamente.
+    if (!cache.refreshStarted) {
+      void atualizarCacheMunicipal();
     }
 
     const atual = await obterProjecaoAtual();
@@ -999,7 +1038,16 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`Projeção Brasil API ouvindo na porta ${PORT}`);
 
-  // Inicia a carga municipal e a gravação do histórico em segundo plano.
-  atualizarCacheMunicipal();
+  // Primeira carga municipal e histórico.
+  void atualizarCacheMunicipal();
   iniciarHistorico();
+
+  // Tenta atualizar a carga a cada minuto, sem sobrepor execuções.
+  // Isso continua funcionando depois que todos os municípios já
+  // estiverem presentes no cache.
+  setInterval(() => {
+    if (!cache.refreshStarted) {
+      void atualizarCacheMunicipal();
+    }
+  }, 60000).unref?.();
 });
