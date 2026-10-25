@@ -5,72 +5,73 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
-const PORT = process.env.PORT || 3000;
-const ELEICAO = "6258";
-const BASE = `https://resultados.tse.jus.br/oficial/ele2026/${ELEICAO}`;
-const CONFIG_URL = `${BASE}/config/mun-e${ELEICAO}-cm.json`;
-
-const UFS = [
-  "ac", "al", "am", "ap", "ba", "ce", "df", "es", "go",
-  "ma", "mg", "ms", "mt", "pa", "pb", "pe", "pi", "pr",
-  "rj", "rn", "ro", "rr", "rs", "sc", "se", "sp", "to"
-];
-
-const NOMES_UF = {
-  ac: "Acre", al: "Alagoas", am: "Amazonas", ap: "Amapá",
-  ba: "Bahia", ce: "Ceará", df: "Distrito Federal",
-  es: "Espírito Santo", go: "Goiás", ma: "Maranhão",
-  mg: "Minas Gerais", ms: "Mato Grosso do Sul",
-  mt: "Mato Grosso", pa: "Pará", pb: "Paraíba",
-  pe: "Pernambuco", pi: "Piauí", pr: "Paraná",
-  rj: "Rio de Janeiro", rn: "Rio Grande do Norte",
-  ro: "Rondônia", rr: "Roraima", rs: "Rio Grande do Sul",
-  sc: "Santa Catarina", se: "Sergipe", sp: "São Paulo",
-  to: "Tocantins"
-};
-
-const cache = {
-  configuracao: null,
-  configuracaoEm: 0,
-  municipios: new Map(),
-  brasil: null,
-  brasilEm: 0
-};
-
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
-
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-function numero(valor) {
-  if (valor === undefined || valor === null || valor === "") {
-    return 0;
-  }
+const PORT = process.env.PORT || 3000;
+const ELEICAO = "6258";
+const ELEICAO_ARQ = "006258";
+const ELEICAO_1T = "6257";
+const BASE = `https://resultados.tse.jus.br/oficial/ele2026/${ELEICAO}`;
+const UFS = [
+  "ac","al","am","ap","ba","ce","df","es","go","ma","mg","ms",
+  "mt","pa","pb","pe","pi","pr","rj","rn","ro","rr","rs","sc","se","sp","to"
+];
 
-  if (typeof valor === "number") {
-    return Number.isFinite(valor) ? valor : 0;
-  }
+const NOMES_UF = {
+  ac:"Acre", al:"Alagoas", am:"Amazonas", ap:"Amapá",
+  ba:"Bahia", ce:"Ceará", df:"Distrito Federal",
+  es:"Espírito Santo", go:"Goiás", ma:"Maranhão",
+  mg:"Minas Gerais", ms:"Mato Grosso do Sul", mt:"Mato Grosso",
+  pa:"Pará", pb:"Paraíba", pe:"Pernambuco", pi:"Piauí",
+  pr:"Paraná", rj:"Rio de Janeiro", rn:"Rio Grande do Norte",
+  ro:"Rondônia", rr:"Roraima", rs:"Rio Grande do Sul",
+  sc:"Santa Catarina", se:"Sergipe", sp:"São Paulo", to:"Tocantins"
+};
 
-  const texto = String(valor).trim();
+const CONFIG_URLS = [
+  `https://resultados.tse.jus.br/oficial/ele2026/${ELEICAO}/config/mun-e${ELEICAO_ARQ}-cm.json`,
+  `https://resultados.tse.jus.br/oficial/ele2026/${ELEICAO_1T}/config/mun-e${ELEICAO_1T}-cm.json`
+];
 
-  const normalizado = texto.includes(",")
-    ? texto.replace(/\./g, "").replace(",", ".")
-    : texto.replace(/\./g, "");
+const URL_NACIONAL_ACOMP =
+  `${BASE}/dados/br/br-e${ELEICAO_ARQ}-ab.json`;
 
-  const resultado = Number(normalizado);
+const URL_NACIONAL_PRESIDENTE =
+  `${BASE}/dados/br/br-c0001-e${ELEICAO_ARQ}-u.json`;
 
-  return Number.isFinite(resultado) ? resultado : 0;
+const cache = {
+  config: null,
+  configAt: 0,
+  national: null,
+  nationalAt: 0,
+  municipalities: new Map(),
+  refreshStarted: false,
+  refreshStatus: "Aguardando inicialização"
+};
+
+const CACHE_MS = 25000;
+const MUNICIPIO_CACHE_MS = 90000;
+
+function num(v) {
+  if (v === null || v === undefined || v === "") return 0;
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  const s = String(v).trim();
+  const n = Number(
+    s.includes(",")
+      ? s.replace(/\./g, "").replace(",", ".")
+      : s
+  );
+  return Number.isFinite(n) ? n : 0;
 }
 
-function percentual(parte, total) {
-  return total > 0 ? (parte / total) * 100 : 0;
+function pct(a, b) {
+  return b > 0 ? a / b * 100 : 0;
 }
 
 async function buscarJson(url, timeoutMs = 12000) {
@@ -78,293 +79,416 @@ async function buscarJson(url, timeoutMs = 12000) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const resposta = await fetch(url, {
+    const response = await fetch(url, {
       signal: controller.signal,
-      headers: {
-        "User-Agent": "ProjecaoBrasil/1.0"
-      },
-      cache: "no-store"
+      cache: "no-store",
+      headers: { "User-Agent": "ProjecaoBrasil/1.0" }
     });
 
-    if (!resposta.ok) {
-      throw new Error(`TSE respondeu HTTP ${resposta.status}`);
+    if (!response.ok) {
+      throw new Error(`TSE respondeu HTTP ${response.status}: ${url}`);
     }
 
-    return await resposta.json();
+    return await response.json();
   } finally {
     clearTimeout(timer);
   }
 }
 
 async function obterConfiguracao() {
-  if (
-    cache.configuracao &&
-    Date.now() - cache.configuracaoEm < 3600000
-  ) {
-    return cache.configuracao;
+  if (cache.config && Date.now() - cache.configAt < 3600000) {
+    return cache.config;
   }
 
-  const dados = await buscarJson(CONFIG_URL);
+  const falhas = [];
 
-  if (!Array.isArray(dados?.abr)) {
-    throw new Error("Formato inesperado da configuração municipal do TSE.");
-  }
-
-  const municipios = [];
-
-  for (const estado of dados.abr) {
-    const uf = String(estado.cd ?? estado.uf ?? "")
-      .trim()
-      .toLowerCase();
-
-    if (!Array.isArray(estado.mu)) continue;
-
-    for (const municipio of estado.mu) {
-      municipios.push({
-        uf,
-        codigo: String(municipio.cd ?? "")
-          .trim()
-          .padStart(5, "0"),
-        codigoIBGE: String(municipio.cdi ?? "").trim(),
-        nome: String(municipio.nm ?? "").trim()
-      });
-    }
-  }
-
-  cache.configuracao = {
-    geracao: dados.idg ?? null,
-    data: dados.dg ?? null,
-    hora: dados.hg ?? null,
-    municipios
-  };
-
-  cache.configuracaoEm = Date.now();
-
-  return cache.configuracao;
-}
-
-function localizarObjetos(raiz, criterio) {
-  const encontrados = [];
-  const visitados = new Set();
-
-  function percorrer(objeto, profundidade = 0) {
-    if (
-      !objeto ||
-      typeof objeto !== "object" ||
-      profundidade > 12 ||
-      visitados.has(objeto)
-    ) {
-      return;
-    }
-
-    visitados.add(objeto);
-
-    if (!Array.isArray(objeto) && criterio(objeto)) {
-      encontrados.push(objeto);
-    }
-
-    if (Array.isArray(objeto)) {
-      for (const item of objeto) {
-        percorrer(item, profundidade + 1);
-      }
-    } else {
-      for (const valor of Object.values(objeto)) {
-        percorrer(valor, profundidade + 1);
-      }
-    }
-  }
-
-  percorrer(raiz);
-  return encontrados;
-}
-
-function resumirEstado(dados, uf) {
-  const objetos = localizarObjetos(
-    dados,
-    objeto => objeto.s && objeto.e
-  );
-
-  const estatisticas = objetos[0] || {};
-  const secoes = estatisticas.s || {};
-  const eleitorado = estatisticas.e || {};
-  const votos = estatisticas.v || {};
-
-  const totalSecoes = numero(secoes.ts);
-  const secoesTotalizadas = numero(secoes.st);
-  const totalEleitores = numero(eleitorado.te);
-  const eleitoresTotalizados = numero(eleitorado.est);
-
-  return {
-    uf,
-    estado: NOMES_UF[uf] || uf.toUpperCase(),
-    geracao: dados?.idg ?? null,
-    dataGeracao: dados?.dg ?? null,
-    horaGeracao: dados?.hg ?? null,
-
-    secoesTotal: totalSecoes,
-    secoesTotalizadas,
-    apuracaoSecoesPct: percentual(
-      secoesTotalizadas,
-      totalSecoes
-    ),
-
-    eleitoradoApto: totalEleitores,
-    eleitoradoTotalizado: eleitoresTotalizados,
-    apuracaoEleitoradoPct: percentual(
-      eleitoresTotalizados,
-      totalEleitores
-    ),
-
-    votosValidos: numero(votos.vvc),
-    votosBrancos: numero(votos.vb),
-    votosNulos: numero(votos.vn)
-  };
-}
-
-async function buscarResultadoEstadual(uf) {
-  const urls = [
-    `${BASE}/dados/${uf}/${uf}-e${ELEICAO}-ab.json`,
-    `${BASE}/dados/${uf}/${uf}-e${ELEICAO}-u.json`
-  ];
-
-  let ultimoErro;
-
-  for (const url of urls) {
+  for (const url of CONFIG_URLS) {
     try {
-      const dados = await buscarJson(url, 8000);
+      const data = await buscarJson(url);
 
-      return {
-        ...resumirEstado(dados, uf),
-        arquivo: url
+      if (!Array.isArray(data?.abr)) {
+        throw new Error(`Formato inesperado no arquivo: ${url}`);
+      }
+
+      const municipios = [];
+
+      for (const estado of data.abr) {
+        const uf = String(estado.cd ?? estado.uf ?? "")
+          .trim()
+          .toLowerCase();
+
+        if (!UFS.includes(uf) || !Array.isArray(estado.mu)) continue;
+
+        for (const m of estado.mu) {
+          const codigo = String(m.cd ?? "").trim().padStart(5, "0");
+
+          if (!/^\d{5}$/.test(codigo)) continue;
+
+          municipios.push({
+            uf,
+            codigo,
+            ibge: String(m.cdi ?? "").trim(),
+            nome: String(m.nm ?? "").trim()
+          });
+        }
+      }
+
+      if (municipios.length === 0) {
+        throw new Error(`Nenhum município encontrado em ${url}`);
+      }
+
+      cache.config = {
+        geracao: data.idg ?? null,
+        data: data.dg ?? null,
+        hora: data.hg ?? null,
+        arquivoConfiguracao: url,
+        municipios
       };
-    } catch (erro) {
-      ultimoErro = erro;
+
+      cache.configAt = Date.now();
+      return cache.config;
+    } catch (e) {
+      falhas.push(e.message);
     }
   }
 
   throw new Error(
-    `${uf.toUpperCase()}: ${
-      ultimoErro?.message || "arquivos estaduais indisponíveis"
-    }`
+    "Não foi possível carregar a configuração municipal. " +
+    falhas.join(" || ")
   );
 }
 
-async function obterBrasil() {
-  if (
-    cache.brasil &&
-    Date.now() - cache.brasilEm < 25000
-  ) {
-    return {
-      ...cache.brasil,
-      cache: true
-    };
+function walk(root, fn, depth = 0, seen = new Set()) {
+  if (!root || typeof root !== "object" || depth > 14 || seen.has(root)) return;
+
+  seen.add(root);
+  fn(root);
+
+  for (const v of Array.isArray(root) ? root : Object.values(root)) {
+    walk(v, fn, depth + 1, seen);
+  }
+}
+
+function findStats(root) {
+  let found = null;
+
+  walk(root, o => {
+    if (!found && !Array.isArray(o) && o.s && o.e) found = o;
+  });
+
+  return found || {};
+}
+
+function findCandidates(root) {
+  const map = new Map();
+
+  walk(root, arr => {
+    if (!Array.isArray(arr)) return;
+
+    for (const c of arr) {
+      if (!c || typeof c !== "object") continue;
+      if (c.vap === undefined && c.pvap === undefined) continue;
+
+      const id = String(c.sqcand ?? c.n ?? c.nr ?? "").trim();
+      const name = String(c.nm ?? c.nmu ?? c.nome ?? "").trim();
+      if (!id && !name) continue;
+
+      const key = id || name;
+      const item = {
+        numero: id,
+        nome: name || id,
+        votos: num(c.vap),
+        percentual: num(c.pvap),
+        partido: String(c.sg ?? c.part ?? "").trim()
+      };
+
+      const old = map.get(key);
+      if (!old || item.votos > old.votos) map.set(key, item);
+    }
+  });
+
+  return [...map.values()].sort((a, b) => b.votos - a.votos);
+}
+
+function resumir(data, uf) {
+  const x = findStats(data);
+  const s = x.s || {};
+  const e = x.e || {};
+  const v = x.v || {};
+
+  return {
+    uf,
+    estado: NOMES_UF[uf] || uf.toUpperCase(),
+    geracao: data?.idg ?? null,
+    dataGeracao: data?.dg ?? null,
+    horaGeracao: data?.hg ?? null,
+    secoesTotal: num(s.ts),
+    secoesTotalizadas: num(s.st),
+    apuracaoSecoesPct: pct(num(s.st), num(s.ts)),
+    eleitoradoApto: num(e.te),
+    eleitoradoTotalizado: num(e.est),
+    apuracaoEleitoradoPct: pct(num(e.est), num(e.te)),
+    votosValidos: num(v.vvc),
+    votosBrancos: num(v.vb),
+    votosNulos: num(v.vn),
+    candidatos: findCandidates(data)
+  };
+}
+
+async function obterResultadoMunicipal(m) {
+  const key = `${m.uf}/${m.codigo}`;
+  const old = cache.municipalities.get(key);
+
+  if (old && Date.now() - old.at < MUNICIPIO_CACHE_MS) {
+    return old.data;
   }
 
-  const inicio = Date.now();
-  const urlNacional = `${BASE}/dados/br/br-e${ELEICAO}-ab.json`;
+  const url =
+    `${BASE}/dados/${m.uf}/${m.uf}${m.codigo}-c0001-e${ELEICAO_ARQ}-u.json`;
 
-  let arquivoNacional = null;
-  let erroNacional = null;
+  const data = await buscarJson(url, 10000);
+
+  const result = {
+    ...resumir(data, m.uf),
+    codigo: m.codigo,
+    codigoIBGE: m.ibge,
+    municipio: m.nome,
+    arquivo: url
+  };
+
+  cache.municipalities.set(key, { at: Date.now(), data: result });
+  return result;
+}
+
+async function atualizarCacheMunicipal() {
+  if (cache.refreshStarted) return;
+
+  cache.refreshStarted = true;
+  cache.refreshStatus = "Carregando configuração municipal";
 
   try {
-    arquivoNacional = await buscarJson(urlNacional, 10000);
-  } catch (erro) {
-    erroNacional = erro.message;
+    const config = await obterConfiguracao();
+    const rows = config.municipios;
+    let success = 0;
+    let failed = 0;
+    const concurrency = 5;
+
+    for (let i = 0; i < rows.length; i += concurrency) {
+      const batch = rows.slice(i, i + concurrency);
+      const results = await Promise.allSettled(
+        batch.map(obterResultadoMunicipal)
+      );
+
+      for (const r of results) {
+        if (r.status === "fulfilled") success++;
+        else failed++;
+      }
+
+      cache.refreshStatus =
+        `Carga municipal: ${success} lidos, ${failed} indisponíveis, ` +
+        `${rows.length} previstos`;
+    }
+
+    cache.refreshStatus =
+      `Carga municipal concluída: ${success} lidos, ${failed} indisponíveis`;
+  } catch (e) {
+    cache.refreshStatus = `Falha na carga municipal: ${e.message}`;
+    console.error(cache.refreshStatus);
+  } finally {
+    cache.refreshStarted = false;
   }
+}
 
-  const consultas = await Promise.allSettled(
-    UFS.map(uf => buscarResultadoEstadual(uf))
-  );
+function projetarMunicipios(rows, totalConfigurado = rows.length) {
+  const byCandidate = new Map();
 
-  const estados = [];
-  const listaFalhas = [];
+  let eligible = 0;
+  let countedElectorate = 0;
+  let totalSections = 0;
+  let countedSections = 0;
+  let officialValid = 0;
+  let officialWhite = 0;
+  let officialNull = 0;
+  let projectedValid = 0;
+  let projectedWhite = 0;
+  let projectedNull = 0;
+  let projectedAbstention = 0;
+  let municipalitiesLoaded = 0;
 
-  for (let i = 0; i < consultas.length; i++) {
-    const resultado = consultas[i];
+  for (const m of rows) {
+    eligible += m.eleitoradoApto;
+    countedElectorate += m.eleitoradoTotalizado;
+    totalSections += m.secoesTotal;
+    countedSections += m.secoesTotalizadas;
+    officialValid += m.votosValidos;
+    officialWhite += m.votosBrancos;
+    officialNull += m.votosNulos;
 
-    if (resultado.status === "fulfilled") {
-      estados.push(resultado.value);
-    } else {
-      listaFalhas.push({
-        uf: UFS[i],
-        erro: resultado.reason?.message || "Erro desconhecido"
-      });
+    if (!m.eleitoradoApto || !m.eleitoradoTotalizado || !m.candidatos.length) {
+      continue;
+    }
+
+    const countedBallots =
+      m.votosValidos + m.votosBrancos + m.votosNulos;
+
+    if (countedBallots <= 0) continue;
+
+    municipalitiesLoaded++;
+
+    const factor = m.eleitoradoApto / m.eleitoradoTotalizado;
+    const projectedVoters = countedBallots * factor;
+
+    projectedValid += m.votosValidos * factor;
+    projectedWhite += m.votosBrancos * factor;
+    projectedNull += m.votosNulos * factor;
+    projectedAbstention += Math.max(0, m.eleitoradoApto - projectedVoters);
+
+    for (const c of m.candidatos) {
+      const key = c.numero || c.nome;
+      const old = byCandidate.get(key) || {
+        numero: c.numero,
+        nome: c.nome,
+        partido: c.partido,
+        votosOficiais: 0,
+        votosProjetados: 0
+      };
+
+      old.votosOficiais += c.votos;
+      old.votosProjetados += c.votos * factor;
+      byCandidate.set(key, old);
     }
   }
 
-  const somar = campo =>
-    estados.reduce(
-      (total, estado) => total + (Number(estado[campo]) || 0),
-      0
-    );
+  const candidates = [...byCandidate.values()]
+    .sort((a, b) => b.votosProjetados - a.votosProjetados);
 
-  const totalSecoes = somar("secoesTotal");
-  const secoesTotalizadas = somar("secoesTotalizadas");
-  const totalEleitores = somar("eleitoradoApto");
-  const eleitoresTotalizados = somar("eleitoradoTotalizado");
+  const totalCandidateVotes = candidates.reduce(
+    (sum, c) => sum + c.votosProjetados, 0
+  );
 
-  const resposta = {
+  for (const c of candidates) {
+    c.percentualProjetado = pct(c.votosProjetados, totalCandidateVotes);
+  }
+
+  return {
+    eleitoradoApto: eligible,
+    eleitoradoTotalizado: countedElectorate,
+    apuracaoEleitoradoPct: pct(countedElectorate, eligible),
+    secoesTotal: totalSections,
+    secoesTotalizadas: countedSections,
+    apuracaoSecoesPct: pct(countedSections, totalSections),
+    votosValidosOficiais: officialValid,
+    votosBrancosOficiais: officialWhite,
+    votosNulosOficiais: officialNull,
+    votosValidosProjetados: projectedValid,
+    votosBrancosProjetados: projectedWhite,
+    votosNulosProjetados: projectedNull,
+    abstencoesProjetadas: projectedAbstention,
+    candidatos: candidates,
+    municipiosConfigurados: totalConfigurado,
+    municipiosComDados: municipalitiesLoaded,
+    municipiosPendentes: Math.max(0, totalConfigurado - municipalitiesLoaded),
+    observacao:
+      "Estimativa preliminar baseada nos municípios com dados válidos. " +
+      "Municípios sem dados não recebem votos inventados. " +
+      "A projeção não deve ser interpretada como resultado oficial."
+  };
+}
+
+async function obterBrasil() {
+  if (cache.national && Date.now() - cache.nationalAt < CACHE_MS) {
+    return { ...cache.national, cache: true };
+  }
+
+  const [tracking, president, stateResults] = await Promise.all([
+    buscarJson(URL_NACIONAL_ACOMP)
+      .then(value => ({ status: "fulfilled", value }))
+      .catch(reason => ({ status: "rejected", reason })),
+
+    buscarJson(URL_NACIONAL_PRESIDENTE)
+      .then(value => ({ status: "fulfilled", value }))
+      .catch(reason => ({ status: "rejected", reason })),
+
+    Promise.allSettled(UFS.map(async uf => {
+      const url = `${BASE}/dados/${uf}/${uf}-e${ELEICAO_ARQ}-ab.json`;
+      const data = await buscarJson(url, 8000);
+      return { ...resumir(data, uf), arquivo: url };
+    }))
+  ]);
+
+  const trackingData = tracking.status === "fulfilled" ? tracking.value : null;
+  const presidentData = president.status === "fulfilled" ? president.value : null;
+
+  const estados = [];
+  const falhasEstados = [];
+
+  stateResults.forEach((r, i) => {
+    if (r.status === "fulfilled") estados.push(r.value);
+    else falhasEstados.push({
+      uf: UFS[i],
+      erro: r.reason?.message || "Falha na consulta"
+    });
+  });
+
+  let config = null;
+  let erroConfiguracao = null;
+
+  try {
+    config = await obterConfiguracao();
+  } catch (e) {
+    erroConfiguracao = e.message;
+  }
+
+  const result = {
     ok: true,
     fonte: "TSE",
     eleicao: ELEICAO,
     turno: 2,
     consultadoEm: new Date().toISOString(),
-    duracaoMs: Date.now() - inicio,
-
-    nacionalDisponivel: Boolean(arquivoNacional),
-    arquivoNacional: urlNacional,
-    geracaoNacional: arquivoNacional?.idg ?? null,
-    erroNacional,
-
-    cobertura: {
-      estadosConsultados: estados.length,
-      estadosEsperados: 27,
-      coberturaCompleta: estados.length === 27,
-      falhas: listaFalhas,
-
-      secoesTotal: totalSecoes,
-      secoesTotalizadas,
-      apuracaoSecoesPct: percentual(
-        secoesTotalizadas,
-        totalSecoes
-      ),
-
-      eleitoradoApto: totalEleitores,
-      eleitoradoTotalizado: eleitoresTotalizados,
-      apuracaoEleitoradoPct: percentual(
-        eleitoresTotalizados,
-        totalEleitores
-      )
+    acompanhamentoNacionalDisponivel: !!trackingData,
+    erroAcompanhamentoNacional:
+      tracking.status === "rejected" ? tracking.reason.message : null,
+    resultadoPresidencialDisponivel: !!presidentData,
+    erroResultadoPresidencial:
+      president.status === "rejected" ? president.reason.message : null,
+    erroConfiguracao,
+    arquivos: {
+      acompanhamento: URL_NACIONAL_ACOMP,
+      resultadoPresidencial: URL_NACIONAL_PRESIDENTE,
+      configuracoesMunicipais: CONFIG_URLS
     },
-
+    oficial: trackingData ? resumir(trackingData, "br") : null,
+    candidatosOficiais: presidentData ? findCandidates(presidentData) : [],
     estados,
-
-    observacao:
-      "Consulta técnica dos arquivos estaduais do TSE. " +
-      "Cobertura incompleta significa que os totais não representam " +
-      "necessariamente todo o Brasil. Esta rota ainda não calcula " +
-      "a projeção estatística municipal."
+    falhasEstados,
+    configuracao: {
+      municipios: config?.municipios.length ?? 0,
+      geracao: config?.geracao ?? null,
+      data: config?.data ?? null,
+      arquivo: config?.arquivoConfiguracao ?? null
+    },
+    cargaMunicipal: {
+      iniciada: cache.refreshStarted,
+      status: cache.refreshStatus,
+      municipiosEmCache: cache.municipalities.size
+    }
   };
 
-  cache.brasil = resposta;
-  cache.brasilEm = Date.now();
-
-  return {
-    ...resposta,
-    cache: false
-  };
+  cache.national = result;
+  cache.nationalAt = Date.now();
+  return { ...result, cache: false };
 }
 
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
-    servico: "Projeção Brasil — Coletor",
+    servico: "Projeção Brasil API",
     eleicao: ELEICAO,
     endpoints: [
       "/api/status",
       "/api/brasil",
+      "/api/projecao",
       "/api/municipios",
-      "/api/diagnostico-municipios",
       "/api/municipio/UF/CODIGO"
     ]
   });
@@ -373,169 +497,116 @@ app.get("/", (_req, res) => {
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    servico: "Projeção Brasil — Coletor",
+    servico: "Projeção Brasil API",
     fonte: "TSE",
     eleicao: ELEICAO,
-    cacheMunicipioSegundos: 45,
-    cacheBrasilSegundos: 25,
-    horarioServidor: new Date().toISOString()
+    horarioServidor: new Date().toISOString(),
+    cargaMunicipal: cache.refreshStatus
   });
+});
+
+app.get("/api/brasil", async (_req, res, next) => {
+  try {
+    const data = await obterBrasil();
+    if (!cache.refreshStarted && cache.municipalities.size === 0) {
+      atualizarCacheMunicipal();
+    }
+    res.json(data);
+  } catch (e) {
+    next(e);
+  }
 });
 
 app.get("/api/municipios", async (_req, res, next) => {
   try {
-    const config = await obterConfiguracao();
+    const c = await obterConfiguracao();
+    res.json({
+      ok: true,
+      total: c.municipios.length,
+      geracao: c.geracao,
+      data: c.data,
+      arquivoConfiguracao: c.arquivoConfiguracao,
+      municipios: c.municipios
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/municipio/:uf/:codigo", async (req, res, next) => {
+  try {
+    const uf = String(req.params.uf).trim().toLowerCase();
+    const codigo = String(req.params.codigo).trim().padStart(5, "0");
+
+    if (!UFS.includes(uf) || !/^\d{5}$/.test(codigo)) {
+      return res.status(400).json({
+        ok: false,
+        erro: "UF ou código municipal inválido"
+      });
+    }
+
+    const c = await obterConfiguracao();
+    const m = c.municipios.find(x => x.uf === uf && x.codigo === codigo);
+
+    if (!m) {
+      return res.status(404).json({
+        ok: false,
+        erro: "Município não encontrado na configuração do TSE"
+      });
+    }
+
+    res.json({ ok: true, ...await obterResultadoMunicipal(m) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get("/api/projecao", async (_req, res, next) => {
+  try {
+    const c = await obterConfiguracao();
+
+    if (!cache.refreshStarted &&
+        cache.municipalities.size < c.municipios.length) {
+      atualizarCacheMunicipal();
+    }
+
+    const rows = c.municipios
+      .map(m => cache.municipalities.get(`${m.uf}/${m.codigo}`)?.data)
+      .filter(Boolean);
+
+    const projection = projetarMunicipios(rows, c.municipios.length);
 
     res.json({
       ok: true,
       fonte: "TSE",
-      dataConfiguracao: config.data,
-      horaConfiguracao: config.hora,
-      geracaoConfiguracao: config.geracao,
-      total: config.municipios.length,
-      municipios: config.municipios
+      eleicao: ELEICAO,
+      calculadoEm: new Date().toISOString(),
+      carga: {
+        status: cache.refreshStatus,
+        emAndamento: cache.refreshStarted,
+        municipiosCarregados: rows.length,
+        municipiosConfigurados: c.municipios.length
+      },
+      projecao: projection,
+      historicoDisponivel: false,
+      observacao:
+        "Projeção preliminar calculada com os dados municipais disponíveis. " +
+        "O histórico persistente requer armazenamento externo."
     });
-  } catch (erro) {
-    next(erro);
+  } catch (e) {
+    next(e);
   }
 });
 
-app.get(
-  "/api/diagnostico-municipios",
-  async (_req, res, next) => {
-    try {
-      const config = await obterConfiguracao();
-      const municipios = config.municipios;
-
-      const codigos = municipios
-        .map(m => m.codigo)
-        .filter(Boolean);
-
-      const codigosIBGE = municipios
-        .map(m => m.codigoIBGE)
-        .filter(Boolean);
-
-      const contarUnicos = valores => new Set(valores).size;
-
-      res.json({
-        ok: true,
-        dataConfiguracao: config.data,
-        horaConfiguracao: config.hora,
-        geracaoConfiguracao: config.geracao,
-        registrosOriginais: municipios.length,
-        codigosMunicipaisUnicos: contarUnicos(codigos),
-        codigosMunicipaisRepetidos:
-          codigos.length - contarUnicos(codigos),
-        codigosIBGEUnicos: contarUnicos(codigosIBGE),
-        codigosIBGERepetidos:
-          codigosIBGE.length - contarUnicos(codigosIBGE),
-        registrosSemIBGE:
-          municipios.filter(m => !m.codigoIBGE).length,
-        totalUFs: [
-          ...new Set(municipios.map(m => m.uf))
-        ].length,
-        UFs: [
-          ...new Set(municipios.map(m => m.uf))
-        ]
-      });
-    } catch (erro) {
-      next(erro);
-    }
-  }
-);
-
-app.get(
-  "/api/municipio/:uf/:codigo",
-  async (req, res, next) => {
-    try {
-      const uf = String(req.params.uf ?? "")
-        .trim()
-        .toLowerCase();
-
-      const codigo = String(req.params.codigo ?? "")
-        .trim()
-        .padStart(5, "0");
-
-      if (!UFS.includes(uf) || !/^\d{5}$/.test(codigo)) {
-        return res.status(400).json({
-          ok: false,
-          erro: "UF ou código municipal inválido."
-        });
-      }
-
-      const chave = `${uf}/${codigo}`;
-      const armazenado = cache.municipios.get(chave);
-
-      if (
-        armazenado &&
-        Date.now() - armazenado.em < 45000
-      ) {
-        return res.json({
-          ...armazenado.dados,
-          cache: true
-        });
-      }
-
-      const url =
-        `${BASE}/dados/${uf}/${uf}${codigo}-c0001-e${ELEICAO}-u.json`;
-
-      const dados = await buscarJson(url);
-      const config = await obterConfiguracao();
-
-      const municipio = config.municipios.find(
-        m => m.uf === uf && m.codigo === codigo
-      );
-
-      const resultado = {
-        ok: true,
-        fonte: "TSE",
-        eleicao: ELEICAO,
-        turno: 2,
-        uf,
-        codigo,
-        municipio: municipio?.nome || codigo,
-        codigoIBGE: municipio?.codigoIBGE || null,
-        arquivo: url,
-        consultadoEm: new Date().toISOString(),
-        geracao: dados?.idg ?? null,
-        dados
-      };
-
-      cache.municipios.set(chave, {
-        em: Date.now(),
-        dados: resultado
-      });
-
-      res.json({
-        ...resultado,
-        cache: false
-      });
-    } catch (erro) {
-      next(erro);
-    }
-  }
-);
-
-app.get("/api/brasil", async (_req, res, next) => {
-  try {
-    res.json(await obterBrasil());
-  } catch (erro) {
-    next(erro);
-  }
-});
-
-app.use((erro, _req, res, _next) => {
-  console.error("Erro no coletor:", erro);
-
-  res.status(erro.status || 502).json({
+app.use((err, _req, res, _next) => {
+  console.error("Erro no coletor:", err);
+  res.status(502).json({
     ok: false,
-    erro: erro.message || "Falha inesperada no coletor.",
+    erro: err.message || "Erro no coletor",
     horarioServidor: new Date().toISOString()
   });
 });
 
 app.listen(PORT, () => {
-  console.log(
-    `Projeção Brasil coletor ouvindo na porta ${PORT}`
-  );
+  console.log(`Projeção Brasil API ouvindo na porta ${PORT}`);
 });
