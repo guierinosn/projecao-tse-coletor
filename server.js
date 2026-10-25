@@ -18,6 +18,7 @@ const ELEICAO = "6258";
 const ELEICAO_ARQ = "006258";
 const ELEICAO_1T = "6257";
 const BASE = `https://resultados.tse.jus.br/oficial/ele2026/${ELEICAO}`;
+
 const UFS = [
   "ac","al","am","ap","ba","ce","df","es","go","ma","mg","ms",
   "mt","pa","pb","pe","pi","pr","rj","rn","ro","rr","rs","sc","se","sp","to"
@@ -56,17 +57,183 @@ const cache = {
 };
 
 const CACHE_MS = 25000;
-const MUNICIPIO_CACHE_MS = 90000;
+const MUNICIPIO_CACHE_MS = 300000;
+
+// As credenciais ficam somente nas variáveis privadas do Render.
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+const HISTORICO_INTERVAL_MS = 60000;
+let ultimoSnapshotHash = "";
+let historicoUltimoErro = null;
+let historicoUltimaGravacao = null;
+let historicoLoopIniciado = false;
+let cicloHistoricoEmAndamento = false;
+
+function supabaseConfigurado() {
+  return Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+}
+
+async function supabaseRequest(path, options = {}) {
+  if (!supabaseConfigurado()) {
+    throw new Error(
+      "Supabase não configurado: verifique SUPABASE_URL e " +
+      "SUPABASE_SERVICE_ROLE_KEY no Render."
+    );
+  }
+
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      ...options.headers
+    }
+  });
+
+  const body = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Supabase HTTP ${response.status}: ${body.slice(0, 500)}`
+    );
+  }
+
+  return body ? JSON.parse(body) : null;
+}
+
+async function gravarSnapshot(dados) {
+  if (!supabaseConfigurado()) {
+    return {
+      salvo: false,
+      motivo: "Supabase não configurado"
+    };
+  }
+
+  const oficial = dados.oficial || dados.brasil?.oficial || null;
+  const candidatosOficiais =
+    dados.candidatosOficiais || dados.brasil?.candidatosOficiais || [];
+
+  // Não grava snapshots idênticos consecutivos.
+  const assinatura = JSON.stringify({
+    eleicao: dados.eleicao,
+    oficial: oficial ? {
+      geracao: oficial.geracao,
+      secoesTotalizadas: oficial.secoesTotalizadas,
+      eleitoradoTotalizado: oficial.eleitoradoTotalizado,
+      votosValidos: oficial.votosValidos,
+      votosBrancos: oficial.votosBrancos,
+      votosNulos: oficial.votosNulos,
+      candidatos: candidatosOficiais
+    } : null,
+    projecao: dados.projecao ? {
+      secoesTotalizadas: dados.projecao.secoesTotalizadas,
+      eleitoradoTotalizado: dados.projecao.eleitoradoTotalizado,
+      votosValidosProjetados: dados.projecao.votosValidosProjetados,
+      candidatos: dados.projecao.candidatos
+    } : null
+  });
+
+  if (assinatura === ultimoSnapshotHash) {
+    return {
+      salvo: false,
+      motivo: "Dados sem alterações",
+      ultimaGravacao: historicoUltimaGravacao
+    };
+  }
+
+  await supabaseRequest("historico_apuracao", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify([{
+      eleicao: String(dados.eleicao || ELEICAO),
+      origem: "TSE",
+      dados
+    }])
+  });
+
+  ultimoSnapshotHash = assinatura;
+  historicoUltimaGravacao = new Date().toISOString();
+  historicoUltimoErro = null;
+
+  return {
+    salvo: true,
+    registradoEm: historicoUltimaGravacao
+  };
+}
+
+async function obterProjecaoAtual() {
+  const c = await obterConfiguracao();
+
+  const rows = c.municipios
+    .map(m => cache.municipalities.get(`${m.uf}/${m.codigo}`)?.data)
+    .filter(Boolean);
+
+  return {
+    calculadoEm: new Date().toISOString(),
+    carga: {
+      status: cache.refreshStatus,
+      emAndamento: cache.refreshStarted,
+      municipiosCarregados: rows.length,
+      municipiosConfigurados: c.municipios.length
+    },
+    projecao: projetarMunicipios(rows, c.municipios.length)
+  };
+}
+
+async function cicloHistorico() {
+  if (!supabaseConfigurado() || cicloHistoricoEmAndamento) return;
+
+  cicloHistoricoEmAndamento = true;
+
+  try {
+    const brasil = await obterBrasil();
+    const proj = await obterProjecaoAtual();
+
+    const resultado = await gravarSnapshot({
+      eleicao: ELEICAO,
+      consultadoEm: new Date().toISOString(),
+      fonte: "TSE",
+      brasil,
+      ...proj
+    });
+
+    if (resultado.salvo) {
+      console.log(
+        "Snapshot do histórico gravado:",
+        resultado.registradoEm
+      );
+    }
+  } catch (e) {
+    historicoUltimoErro = e.message || String(e);
+    console.error("Falha ao gravar histórico:", historicoUltimoErro);
+  } finally {
+    cicloHistoricoEmAndamento = false;
+  }
+}
+
+function iniciarHistorico() {
+  if (historicoLoopIniciado) return;
+
+  historicoLoopIniciado = true;
+  cicloHistorico();
+
+  setInterval(cicloHistorico, HISTORICO_INTERVAL_MS);
+}
 
 function num(v) {
   if (v === null || v === undefined || v === "") return 0;
   if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+
   const s = String(v).trim();
   const n = Number(
     s.includes(",")
       ? s.replace(/\./g, "").replace(",", ".")
       : s
   );
+
   return Number.isFinite(n) ? n : 0;
 }
 
@@ -159,7 +326,12 @@ async function obterConfiguracao() {
 }
 
 function walk(root, fn, depth = 0, seen = new Set()) {
-  if (!root || typeof root !== "object" || depth > 14 || seen.has(root)) return;
+  if (
+    !root ||
+    typeof root !== "object" ||
+    depth > 14 ||
+    seen.has(root)
+  ) return;
 
   seen.add(root);
   fn(root);
@@ -191,9 +363,11 @@ function findCandidates(root) {
 
       const id = String(c.sqcand ?? c.n ?? c.nr ?? "").trim();
       const name = String(c.nm ?? c.nmu ?? c.nome ?? "").trim();
+
       if (!id && !name) continue;
 
       const key = id || name;
+
       const item = {
         numero: id,
         nome: name || id,
@@ -203,7 +377,10 @@ function findCandidates(root) {
       };
 
       const old = map.get(key);
-      if (!old || item.votos > old.votos) map.set(key, item);
+
+      if (!old || item.votos > old.votos) {
+        map.set(key, item);
+      }
     }
   });
 
@@ -256,7 +433,11 @@ async function obterResultadoMunicipal(m) {
     arquivo: url
   };
 
-  cache.municipalities.set(key, { at: Date.now(), data: result });
+  cache.municipalities.set(key, {
+    at: Date.now(),
+    data: result
+  });
+
   return result;
 }
 
@@ -269,12 +450,14 @@ async function atualizarCacheMunicipal() {
   try {
     const config = await obterConfiguracao();
     const rows = config.municipios;
+
     let success = 0;
     let failed = 0;
     const concurrency = 5;
 
     for (let i = 0; i < rows.length; i += concurrency) {
       const batch = rows.slice(i, i + concurrency);
+
       const results = await Promise.allSettled(
         batch.map(obterResultadoMunicipal)
       );
@@ -324,9 +507,11 @@ function projetarMunicipios(rows, totalConfigurado = rows.length) {
     officialWhite += m.votosBrancos;
     officialNull += m.votosNulos;
 
-    if (!m.eleitoradoApto || !m.eleitoradoTotalizado || !m.candidatos.length) {
-      continue;
-    }
+    if (
+      !m.eleitoradoApto ||
+      !m.eleitoradoTotalizado ||
+      !m.candidatos.length
+    ) continue;
 
     const countedBallots =
       m.votosValidos + m.votosBrancos + m.votosNulos;
@@ -341,10 +526,14 @@ function projetarMunicipios(rows, totalConfigurado = rows.length) {
     projectedValid += m.votosValidos * factor;
     projectedWhite += m.votosBrancos * factor;
     projectedNull += m.votosNulos * factor;
-    projectedAbstention += Math.max(0, m.eleitoradoApto - projectedVoters);
+    projectedAbstention += Math.max(
+      0,
+      m.eleitoradoApto - projectedVoters
+    );
 
     for (const c of m.candidatos) {
       const key = c.numero || c.nome;
+
       const old = byCandidate.get(key) || {
         numero: c.numero,
         nome: c.nome,
@@ -363,11 +552,15 @@ function projetarMunicipios(rows, totalConfigurado = rows.length) {
     .sort((a, b) => b.votosProjetados - a.votosProjetados);
 
   const totalCandidateVotes = candidates.reduce(
-    (sum, c) => sum + c.votosProjetados, 0
+    (sum, c) => sum + c.votosProjetados,
+    0
   );
 
   for (const c of candidates) {
-    c.percentualProjetado = pct(c.votosProjetados, totalCandidateVotes);
+    c.percentualProjetado = pct(
+      c.votosProjetados,
+      totalCandidateVotes
+    );
   }
 
   return {
@@ -387,7 +580,10 @@ function projetarMunicipios(rows, totalConfigurado = rows.length) {
     candidatos: candidates,
     municipiosConfigurados: totalConfigurado,
     municipiosComDados: municipalitiesLoaded,
-    municipiosPendentes: Math.max(0, totalConfigurado - municipalitiesLoaded),
+    municipiosPendentes: Math.max(
+      0,
+      totalConfigurado - municipalitiesLoaded
+    ),
     observacao:
       "Estimativa preliminar baseada nos municípios com dados válidos. " +
       "Municípios sem dados não recebem votos inventados. " +
@@ -412,22 +608,32 @@ async function obterBrasil() {
     Promise.allSettled(UFS.map(async uf => {
       const url = `${BASE}/dados/${uf}/${uf}-e${ELEICAO_ARQ}-ab.json`;
       const data = await buscarJson(url, 8000);
-      return { ...resumir(data, uf), arquivo: url };
+
+      return {
+        ...resumir(data, uf),
+        arquivo: url
+      };
     }))
   ]);
 
-  const trackingData = tracking.status === "fulfilled" ? tracking.value : null;
-  const presidentData = president.status === "fulfilled" ? president.value : null;
+  const trackingData =
+    tracking.status === "fulfilled" ? tracking.value : null;
+
+  const presidentData =
+    president.status === "fulfilled" ? president.value : null;
 
   const estados = [];
   const falhasEstados = [];
 
   stateResults.forEach((r, i) => {
-    if (r.status === "fulfilled") estados.push(r.value);
-    else falhasEstados.push({
-      uf: UFS[i],
-      erro: r.reason?.message || "Falha na consulta"
-    });
+    if (r.status === "fulfilled") {
+      estados.push(r.value);
+    } else {
+      falhasEstados.push({
+        uf: UFS[i],
+        erro: r.reason?.message || "Falha na consulta"
+      });
+    }
   });
 
   let config = null;
@@ -476,6 +682,7 @@ async function obterBrasil() {
 
   cache.national = result;
   cache.nationalAt = Date.now();
+
   return { ...result, cache: false };
 }
 
@@ -488,6 +695,7 @@ app.get("/", (_req, res) => {
       "/api/status",
       "/api/brasil",
       "/api/projecao",
+      "/api/historico",
       "/api/municipios",
       "/api/municipio/UF/CODIGO"
     ]
@@ -501,16 +709,59 @@ app.get("/api/status", (_req, res) => {
     fonte: "TSE",
     eleicao: ELEICAO,
     horarioServidor: new Date().toISOString(),
-    cargaMunicipal: cache.refreshStatus
+    cargaMunicipal: cache.refreshStatus,
+    historico: {
+      configurado: supabaseConfigurado(),
+      ultimaGravacao: historicoUltimaGravacao,
+      ultimoErro: historicoUltimoErro
+    }
   });
+});
+
+app.get("/api/historico", async (req, res, next) => {
+  try {
+    if (!supabaseConfigurado()) {
+      return res.status(503).json({
+        ok: false,
+        erro: "Supabase não configurado no Render."
+      });
+    }
+
+    const rawLimit = Number.parseInt(
+      String(req.query.limit || "100"),
+      10
+    );
+
+    const limit = Number.isFinite(rawLimit)
+      ? Math.max(1, Math.min(500, rawLimit))
+      : 100;
+
+    const rows = await supabaseRequest(
+      `historico_apuracao?select=id,eleicao,registrado_em,origem,dados` +
+      `&eleicao=eq.${encodeURIComponent(ELEICAO)}` +
+      `&order=registrado_em.desc&limit=${limit}`,
+      { method: "GET" }
+    );
+
+    res.json({
+      ok: true,
+      total: rows.length,
+      historicoDisponivel: rows.length > 0,
+      registros: rows
+    });
+  } catch (e) {
+    next(e);
+  }
 });
 
 app.get("/api/brasil", async (_req, res, next) => {
   try {
     const data = await obterBrasil();
+
     if (!cache.refreshStarted && cache.municipalities.size === 0) {
       atualizarCacheMunicipal();
     }
+
     res.json(data);
   } catch (e) {
     next(e);
@@ -520,6 +771,7 @@ app.get("/api/brasil", async (_req, res, next) => {
 app.get("/api/municipios", async (_req, res, next) => {
   try {
     const c = await obterConfiguracao();
+
     res.json({
       ok: true,
       total: c.municipios.length,
@@ -546,7 +798,9 @@ app.get("/api/municipio/:uf/:codigo", async (req, res, next) => {
     }
 
     const c = await obterConfiguracao();
-    const m = c.municipios.find(x => x.uf === uf && x.codigo === codigo);
+    const m = c.municipios.find(
+      x => x.uf === uf && x.codigo === codigo
+    );
 
     if (!m) {
       return res.status(404).json({
@@ -555,7 +809,10 @@ app.get("/api/municipio/:uf/:codigo", async (req, res, next) => {
       });
     }
 
-    res.json({ ok: true, ...await obterResultadoMunicipal(m) });
+    res.json({
+      ok: true,
+      ...await obterResultadoMunicipal(m)
+    });
   } catch (e) {
     next(e);
   }
@@ -565,34 +822,49 @@ app.get("/api/projecao", async (_req, res, next) => {
   try {
     const c = await obterConfiguracao();
 
-    if (!cache.refreshStarted &&
-        cache.municipalities.size < c.municipios.length) {
+    if (
+      !cache.refreshStarted &&
+      cache.municipalities.size < c.municipios.length
+    ) {
       atualizarCacheMunicipal();
     }
 
-    const rows = c.municipios
-      .map(m => cache.municipalities.get(`${m.uf}/${m.codigo}`)?.data)
-      .filter(Boolean);
+    const atual = await obterProjecaoAtual();
 
-    const projection = projetarMunicipios(rows, c.municipios.length);
-
-    res.json({
+    const payload = {
       ok: true,
       fonte: "TSE",
       eleicao: ELEICAO,
-      calculadoEm: new Date().toISOString(),
-      carga: {
-        status: cache.refreshStatus,
-        emAndamento: cache.refreshStarted,
-        municipiosCarregados: rows.length,
-        municipiosConfigurados: c.municipios.length
-      },
-      projecao: projection,
-      historicoDisponivel: false,
+      calculadoEm: atual.calculadoEm,
+      carga: atual.carga,
+      projecao: atual.projecao,
+      historicoDisponivel: null,
       observacao:
-        "Projeção preliminar calculada com os dados municipais disponíveis. " +
-        "O histórico persistente requer armazenamento externo."
-    });
+        "Estimativa preliminar baseada nos municípios com dados válidos. " +
+        "Municípios sem dados não recebem votos inventados. " +
+        "A projeção não deve ser interpretada como resultado oficial."
+    };
+
+    try {
+      const gravacao = await gravarSnapshot({
+        eleicao: ELEICAO,
+        consultadoEm: new Date().toISOString(),
+        fonte: "TSE",
+        projecao: atual.projecao,
+        carga: atual.carga
+      });
+
+      payload.historicoDisponivel =
+        gravacao.salvo || historicoUltimaGravacao !== null;
+
+      payload.historicoGravacao = gravacao;
+    } catch (e) {
+      historicoUltimoErro = e.message || String(e);
+      payload.historicoDisponivel = false;
+      payload.erroHistorico = historicoUltimoErro;
+    }
+
+    res.json(payload);
   } catch (e) {
     next(e);
   }
@@ -600,6 +872,7 @@ app.get("/api/projecao", async (_req, res, next) => {
 
 app.use((err, _req, res, _next) => {
   console.error("Erro no coletor:", err);
+
   res.status(502).json({
     ok: false,
     erro: err.message || "Erro no coletor",
@@ -609,4 +882,8 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`Projeção Brasil API ouvindo na porta ${PORT}`);
+
+  // Inicia a carga municipal e a gravação do histórico em segundo plano.
+  atualizarCacheMunicipal();
+  iniciarHistorico();
 });
