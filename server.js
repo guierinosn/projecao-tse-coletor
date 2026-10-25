@@ -4,12 +4,16 @@ import express from "express";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const TSE_URL =
-  "https://resultados.tse.jus.br/oficial/ele2026/6258/dados/br/br-c0001-e006258-u.json";
+const BASE =
+  "https://resultados.tse.jus.br/oficial/ele2026/6258";
 
-const CACHE_MS = 30_000;
-let cache = null;
-let cacheAt = 0;
+const CONFIG_URL = `${BASE}/config/mun-e006258-cm.json`;
+const CACHE_MS = 60_000;
+const TIMEOUT_MS = 15_000;
+
+const cache = new Map();
+let configCache = null;
+let configCacheAt = 0;
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -23,11 +27,52 @@ app.use((req, res, next) => {
   next();
 });
 
+async function buscarJSON(url) {
+  const resposta = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0"
+    },
+    signal: AbortSignal.timeout(TIMEOUT_MS)
+  });
+
+  if (!resposta.ok) {
+    throw new Error(`TSE respondeu HTTP ${resposta.status}`);
+  }
+
+  return resposta.json();
+}
+
+async function obterConfiguracao() {
+  if (configCache && Date.now() - configCacheAt < 3600000) {
+    return configCache;
+  }
+
+  const dados = await buscarJSON(CONFIG_URL);
+
+  if (!Array.isArray(dados.abr)) {
+    throw new Error("Formato inesperado na configuração municipal do TSE.");
+  }
+
+  configCache = dados;
+  configCacheAt = Date.now();
+
+  return dados;
+}
+
+function normalizarCodigo(valor) {
+  return String(valor).trim().padStart(5, "0");
+}
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
     servico: "Projeção Brasil — Coletor",
-    rotas: ["/api/status", "/api/brasil", "/api/diagnostico"]
+    rotas: [
+      "/api/status",
+      "/api/municipios",
+      "/api/municipio/ac/01473"
+    ]
   });
 });
 
@@ -36,80 +81,115 @@ app.get("/api/status", (req, res) => {
     ok: true,
     servico: "Projeção Brasil — Coletor",
     fonte: "TSE",
-    cacheSegundos: CACHE_MS / 1000
+    cacheResultadosSegundos: CACHE_MS / 1000
   });
 });
 
-async function buscarTSE() {
-  const resposta = await fetch(TSE_URL, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "Mozilla/5.0"
-    },
-    signal: AbortSignal.timeout(15000)
-  });
-
-  if (!resposta.ok) {
-    throw new Error(`TSE respondeu HTTP ${resposta.status}`);
-  }
-
-  return await resposta.json();
-}
-
-app.get("/api/brasil", async (req, res) => {
+app.get("/api/municipios", async (req, res) => {
   try {
-    if (cache && Date.now() - cacheAt < CACHE_MS) {
-      return res.json({
-        ...cache,
-        cache: true
-      });
+    const config = await obterConfiguracao();
+    const municipios = [];
+
+    for (const estado of config.abr) {
+      for (const municipio of estado.mu || []) {
+        municipios.push({
+          uf: String(estado.cd || "").toLowerCase(),
+          codigo: normalizarCodigo(municipio.cd),
+          codigoIBGE: municipio.cdi || null,
+          nome: municipio.nm,
+          capital: municipio.c === "s",
+          zonas: municipio.z || []
+        });
+      }
     }
 
-    const dados = await buscarTSE();
-
-    cache = {
-      ok: true,
-      fonte: "TSE",
-      arquivo: "Resultado nacional — Presidente — 2º turno",
-      consultadoEm: new Date().toISOString(),
-      geracao: dados.idg,
-      dados
-    };
-
-    cacheAt = Date.now();
-
-    res.json({
-      ...cache,
-      cache: false
-    });
-  } catch (erro) {
-    res.status(502).json({
-      ok: false,
-      fonte: "TSE",
-      erro: "Não foi possível consultar os resultados oficiais.",
-      detalhe: String(erro),
-      consultadoEm: new Date().toISOString()
-    });
-  }
-});
-
-app.get("/api/diagnostico", async (req, res) => {
-  try {
-    const dados = await buscarTSE();
-
     res.json({
       ok: true,
-      statusOrigem: 200,
-      geracao: dados.idg,
-      data: dados.dg,
-      hora: dados.hg,
-      amostra: JSON.stringify(dados).slice(0, 500),
-      consultadoEm: new Date().toISOString()
+      fonte: "TSE",
+      atualizadoEm: new Date().toISOString(),
+      totalMunicipios: municipios.length,
+      municipios
     });
   } catch (erro) {
     res.status(502).json({
       ok: false,
       erro: String(erro),
+      consultadoEm: new Date().toISOString()
+    });
+  }
+});
+
+app.get("/api/municipio/:uf/:codigo", async (req, res) => {
+  try {
+    const uf = String(req.params.uf).toLowerCase();
+    const codigo = normalizarCodigo(req.params.codigo);
+
+    if (!/^[a-z]{2}$/.test(uf) || !/^\d{5}$/.test(codigo)) {
+      return res.status(400).json({
+        ok: false,
+        erro: "Informe uma UF válida e um código municipal de cinco dígitos."
+      });
+    }
+
+    const chave = `${uf}-${codigo}`;
+    const anterior = cache.get(chave);
+
+    if (anterior && Date.now() - anterior.at < CACHE_MS) {
+      return res.json({
+        ...anterior.resposta,
+        cache: true
+      });
+    }
+
+    const config = await obterConfiguracao();
+    const estado = config.abr.find(
+      item => String(item.cd || "").toLowerCase() === uf
+    );
+
+    const municipio = estado?.mu?.find(
+      item => normalizarCodigo(item.cd) === codigo
+    );
+
+    if (!municipio) {
+      return res.status(404).json({
+        ok: false,
+        erro: "Município não encontrado na configuração do TSE.",
+        uf,
+        codigo
+      });
+    }
+
+    const url =
+      `${BASE}/dados/${uf}/${uf}${codigo}-c0001-e006258-u.json`;
+
+    const dados = await buscarJSON(url);
+
+    const resposta = {
+      ok: true,
+      fonte: "TSE",
+      municipio: municipio.nm,
+      uf,
+      codigo,
+      arquivo: url,
+      consultadoEm: new Date().toISOString(),
+      geracao: dados.idg || null,
+      dados
+    };
+
+    cache.set(chave, {
+      at: Date.now(),
+      resposta
+    });
+
+    res.json({
+      ...resposta,
+      cache: false
+    });
+  } catch (erro) {
+    res.status(502).json({
+      ok: false,
+      erro: "Não foi possível consultar os resultados municipais.",
+      detalhe: String(erro),
       consultadoEm: new Date().toISOString()
     });
   }
