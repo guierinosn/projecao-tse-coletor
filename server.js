@@ -44,14 +44,19 @@ async function buscarJSON(url) {
 }
 
 async function obterConfiguracao() {
-  if (configCache && Date.now() - configCacheAt < 3600000) {
+  if (
+    configCache &&
+    Date.now() - configCacheAt < 3600000
+  ) {
     return configCache;
   }
 
   const dados = await buscarJSON(CONFIG_URL);
 
   if (!Array.isArray(dados.abr)) {
-    throw new Error("Formato inesperado na configuração municipal do TSE.");
+    throw new Error(
+      "Formato inesperado na configuração municipal do TSE."
+    );
   }
 
   configCache = dados;
@@ -61,16 +66,18 @@ async function obterConfiguracao() {
 }
 
 function normalizarCodigo(valor) {
-  return String(valor).trim().padStart(5, "0");
+  return String(valor ?? "").trim().padStart(5, "0");
 }
 
 app.get("/", (req, res) => {
   res.json({
     ok: true,
     servico: "Projeção Brasil — Coletor",
+    fonte: "TSE",
     rotas: [
       "/api/status",
       "/api/municipios",
+      "/api/diagnostico-municipios",
       "/api/municipio/ac/01473"
     ]
   });
@@ -81,10 +88,10 @@ app.get("/api/status", (req, res) => {
     ok: true,
     servico: "Projeção Brasil — Coletor",
     fonte: "TSE",
-    cacheResultadosSegundos: CACHE_MS / 1000
+    cacheResultadosSegundos: CACHE_MS / 1000,
+    horarioServidor: new Date().toISOString()
   });
 });
-
 
 app.get("/api/municipios", async (req, res) => {
   try {
@@ -92,12 +99,17 @@ app.get("/api/municipios", async (req, res) => {
     const mapa = new Map();
 
     for (const estado of config.abr) {
-      const uf = String(estado.cd || "").trim().toLowerCase();
+      const uf = String(estado.cd || "")
+        .trim()
+        .toLowerCase();
 
       for (const municipio of estado.mu || []) {
         const codigo = normalizarCodigo(municipio.cd);
 
-        if (!/^[a-z]{2}$/.test(uf) || !/^\d{5}$/.test(codigo)) {
+        if (
+          !/^[a-z]{2}$/.test(uf) ||
+          !/^\d{5}$/.test(codigo)
+        ) {
           continue;
         }
 
@@ -106,7 +118,8 @@ app.get("/api/municipios", async (req, res) => {
         mapa.set(chave, {
           uf,
           codigo,
-          codigoIBGE: String(municipio.cdi || "").trim() || null,
+          codigoIBGE:
+            String(municipio.cdi || "").trim() || null,
           nome: String(municipio.nm || "").trim(),
           capital: municipio.c === "s",
           zonas: municipio.z || []
@@ -136,29 +149,64 @@ app.get("/api/municipios", async (req, res) => {
   }
 });
 
+app.get("/api/diagnostico-municipios", async (req, res) => {
   try {
     const config = await obterConfiguracao();
-    const municipios = [];
+
+    const porCodigo = new Set();
+    const porIBGE = new Set();
+    const porUF = new Set();
+
+    let semIBGE = 0;
+    let registros = 0;
+    let codigosRepetidos = 0;
+    let ibgeRepetidos = 0;
 
     for (const estado of config.abr) {
+      const uf = String(estado.cd || "")
+        .trim()
+        .toLowerCase();
+
+      if (uf) porUF.add(uf);
+
       for (const municipio of estado.mu || []) {
-        municipios.push({
-          uf: String(estado.cd || "").toLowerCase(),
-          codigo: normalizarCodigo(municipio.cd),
-          codigoIBGE: municipio.cdi || null,
-          nome: municipio.nm,
-          capital: municipio.c === "s",
-          zonas: municipio.z || []
-        });
+        registros++;
+
+        const codigo = normalizarCodigo(municipio.cd);
+        const chave = `${uf}-${codigo}`;
+        const ibge = String(municipio.cdi || "").trim();
+
+        if (porCodigo.has(chave)) {
+          codigosRepetidos++;
+        }
+
+        porCodigo.add(chave);
+
+        if (!ibge) {
+          semIBGE++;
+        } else {
+          if (porIBGE.has(ibge)) {
+            ibgeRepetidos++;
+          }
+
+          porIBGE.add(ibge);
+        }
       }
     }
 
     res.json({
       ok: true,
-      fonte: "TSE",
-      atualizadoEm: new Date().toISOString(),
-      totalMunicipios: municipios.length,
-      municipios
+      dataConfiguracao: config.dg || null,
+      horaConfiguracao: config.hg || null,
+      geracaoConfiguracao: config.idg || null,
+      registrosOriginais: registros,
+      codigosMunicipaisUnicos: porCodigo.size,
+      codigosMunicipaisRepetidos: codigosRepetidos,
+      codigosIBGEUnicos: porIBGE.size,
+      codigosIBGERepetidos: ibgeRepetidos,
+      registrosSemIBGE: semIBGE,
+      totalUFs: porUF.size,
+      UFs: [...porUF].sort()
     });
   } catch (erro) {
     res.status(502).json({
@@ -171,13 +219,20 @@ app.get("/api/municipios", async (req, res) => {
 
 app.get("/api/municipio/:uf/:codigo", async (req, res) => {
   try {
-    const uf = String(req.params.uf).toLowerCase();
+    const uf = String(req.params.uf || "")
+      .trim()
+      .toLowerCase();
+
     const codigo = normalizarCodigo(req.params.codigo);
 
-    if (!/^[a-z]{2}$/.test(uf) || !/^\d{5}$/.test(codigo)) {
+    if (
+      !/^[a-z]{2}$/.test(uf) ||
+      !/^\d{5}$/.test(codigo)
+    ) {
       return res.status(400).json({
         ok: false,
-        erro: "Informe uma UF válida e um código municipal de cinco dígitos."
+        erro:
+          "Informe uma UF válida e um código municipal de cinco dígitos."
       });
     }
 
@@ -192,8 +247,10 @@ app.get("/api/municipio/:uf/:codigo", async (req, res) => {
     }
 
     const config = await obterConfiguracao();
+
     const estado = config.abr.find(
-      item => String(item.cd || "").toLowerCase() === uf
+      item =>
+        String(item.cd || "").trim().toLowerCase() === uf
     );
 
     const municipio = estado?.mu?.find(
@@ -217,7 +274,7 @@ app.get("/api/municipio/:uf/:codigo", async (req, res) => {
     const resposta = {
       ok: true,
       fonte: "TSE",
-      municipio: municipio.nm,
+      municipio: String(municipio.nm || "").trim(),
       uf,
       codigo,
       arquivo: url,
@@ -231,122 +288,16 @@ app.get("/api/municipio/:uf/:codigo", async (req, res) => {
       resposta
     });
 
-    res.json({
+    return res.json({
       ...resposta,
       cache: false
     });
   } catch (erro) {
-    res.status(502).json({
+    return res.status(502).json({
       ok: false,
       erro: "Não foi possível consultar os resultados municipais.",
       detalhe: String(erro),
       consultadoEm: new Date().toISOString()
-    });
-  }
-});
-
-
-app.get("/api/diagnostico-municipios", async (req, res) => {
-  try {
-    const config = await obterConfiguracao();
-    const porCodigo = new Set();
-    const porIBGE = new Set();
-    const porUF = new Set();
-    let semIBGE = 0;
-    let registros = 0;
-    let codigosRepetidos = 0;
-    let ibgeRepetidos = 0;
-
-    for (const estado of config.abr) {
-      const uf = String(estado.cd || "").trim().toLowerCase();
-      if (uf) porUF.add(uf);
-
-      for (const municipio of estado.mu || []) {
-        registros++;
-
-        const codigo = normalizarCodigo(municipio.cd);
-        const chave = `${uf}-${codigo}`;
-        const ibge = String(municipio.cdi || "").trim();
-
-        if (porCodigo.has(chave)) codigosRepetidos++;
-        porCodigo.add(chave);
-
-        if (!ibge) {
-          semIBGE++;
-        } else {
-          if (porIBGE.has(ibge)) ibgeRepetidos++;
-          porIBGE.add(ibge);
-        }
-      }
-    }
-
-    res.json({
-      ok: true,
-      registrosOriginais: registros,
-      codigosMunicipaisUnicos: porCodigo.size,
-      codigosMunicipaisRepetidos: codigosRepetidos,
-      codigosIBGEUnicos: porIBGE.size,
-      codigosIBGERepetidos: ibgeRepetidos,
-      registrosSemIBGE: semIBGE,
-      totalUFs: porUF.size,
-      UFs: [...porUF].sort()
-    });
-  } catch (erro) {
-    res.status(502).json({
-      ok: false,
-      erro: String(erro)
-    });
-  }
-});
-app.get("/api/diagnostico-municipios", async (req, res) => {
-  try {
-    const config = await obterConfiguracao();
-    const porCodigo = new Set();
-    const porIBGE = new Set();
-    const porUF = new Set();
-    let semIBGE = 0;
-    let registros = 0;
-    let codigosRepetidos = 0;
-    let ibgeRepetidos = 0;
-
-    for (const estado of config.abr) {
-      const uf = String(estado.cd || "").trim().toLowerCase();
-      if (uf) porUF.add(uf);
-
-      for (const municipio of estado.mu || []) {
-        registros++;
-
-        const codigo = normalizarCodigo(municipio.cd);
-        const chave = `${uf}-${codigo}`;
-        const ibge = String(municipio.cdi || "").trim();
-
-        if (porCodigo.has(chave)) codigosRepetidos++;
-        porCodigo.add(chave);
-
-        if (!ibge) {
-          semIBGE++;
-        } else {
-          if (porIBGE.has(ibge)) ibgeRepetidos++;
-          porIBGE.add(ibge);
-        }
-      }
-    }
-
-    res.json({
-      ok: true,
-      registrosOriginais: registros,
-      codigosMunicipaisUnicos: porCodigo.size,
-      codigosMunicipaisRepetidos: codigosRepetidos,
-      codigosIBGEUnicos: porIBGE.size,
-      codigosIBGERepetidos: ibgeRepetidos,
-      registrosSemIBGE: semIBGE,
-      totalUFs: porUF.size,
-      UFs: [...porUF].sort()
-    });
-  } catch (erro) {
-    res.status(502).json({
-      ok: false,
-      erro: String(erro)
     });
   }
 });
