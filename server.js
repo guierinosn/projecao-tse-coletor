@@ -1,3 +1,4 @@
+
 import express from "express";
 
 const app = express();
@@ -17,19 +18,10 @@ const ELEICAO = "6258";
 const ELEICAO_ARQ = "006258";
 const ELEICAO_1T = "6257";
 const BASE = `https://resultados.tse.jus.br/oficial/ele2026/${ELEICAO}`;
-const ELEITORADO_REFERENCIA_NACIONAL = 158745463;
-
-const URL_NACIONAL_ACOMP =
-  `${BASE}/dados/br/br-e${ELEICAO_ARQ}-ab.json`;
-const URL_NACIONAL_PRESIDENTE =
-  `${BASE}/dados/br/br-c0001-e${ELEICAO_ARQ}-u.json`;
-const URL_EXTERIOR_PRESIDENTE =
-  `${BASE}/dados/zz/zz-c0001-e${ELEICAO_ARQ}-u.json`;
 
 const UFS = [
   "ac","al","am","ap","ba","ce","df","es","go","ma","mg","ms",
-  "mt","pa","pb","pe","pi","pr","rj","rn","ro","rr","rs","sc",
-  "se","sp","to"
+  "mt","pa","pb","pe","pi","pr","rj","rn","ro","rr","rs","sc","se","sp","to"
 ];
 
 const NOMES_UF = {
@@ -44,9 +36,21 @@ const NOMES_UF = {
 };
 
 const CONFIG_URLS = [
-  `${BASE}/config/mun-e${ELEICAO_ARQ}-cm.json`,
+  `https://resultados.tse.jus.br/oficial/ele2026/${ELEICAO}/config/mun-e${ELEICAO_ARQ}-cm.json`,
   `https://resultados.tse.jus.br/oficial/ele2026/${ELEICAO_1T}/config/mun-e${ELEICAO_1T}-cm.json`
 ];
+
+const URL_NACIONAL_ACOMP =
+  `${BASE}/dados/br/br-e${ELEICAO_ARQ}-ab.json`;
+
+const URL_NACIONAL_PRESIDENTE =
+  `${BASE}/dados/br/br-c0001-e${ELEICAO_ARQ}-u.json`;
+
+// Totalização presidencial do exterior (abrangência ZZ).
+// É usada apenas na projeção baseada em localidades; o arquivo BR oficial
+// já agrega o exterior e não deve receber esta soma novamente.
+const URL_EXTERIOR_PRESIDENTE =
+  `${BASE}/dados/zz/zz-c0001-e${ELEICAO_ARQ}-u.json`;
 
 const cache = {
   config: null,
@@ -56,6 +60,7 @@ const cache = {
   municipalities: new Map(),
   exterior: null,
   exteriorAt: 0,
+  exteriorError: null,
   refreshStarted: false,
   refreshStatus: "Aguardando inicialização"
 };
@@ -64,8 +69,8 @@ const CACHE_MS = 25000;
 const MUNICIPIO_CACHE_MS = 300000;
 const EXTERIOR_CACHE_MS = 60000;
 
-const SUPABASE_URL =
-  (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+// As credenciais ficam somente nas variáveis privadas do Render.
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
@@ -111,14 +116,17 @@ async function supabaseRequest(path, options = {}) {
 
 async function gravarSnapshot(dados) {
   if (!supabaseConfigurado()) {
-    return { salvo: false, motivo: "Supabase não configurado" };
+    return {
+      salvo: false,
+      motivo: "Supabase não configurado"
+    };
   }
 
   const oficial = dados.oficial || dados.brasil?.oficial || null;
   const candidatosOficiais =
-    dados.candidatosOficiais ||
-    dados.brasil?.candidatosOficiais || [];
+    dados.candidatosOficiais || dados.brasil?.candidatosOficiais || [];
 
+  // Não grava snapshots idênticos consecutivos.
   const assinatura = JSON.stringify({
     eleicao: dados.eleicao,
     oficial: oficial ? {
@@ -131,8 +139,9 @@ async function gravarSnapshot(dados) {
       candidatos: candidatosOficiais
     } : null,
     projecao: dados.projecao ? {
-      secoesTotalizadas: dados.projecao.secoesTotalizadas,
-      eleitoradoTotalizado: dados.projecao.eleitoradoTotalizado,
+      apuracaoVotosPct: dados.projecao.apuracaoVotosPct,
+      votosApurados: dados.projecao.votosApurados,
+      votosFinaisProjetados: dados.projecao.votosFinaisProjetados,
       votosValidosProjetados: dados.projecao.votosValidosProjetados,
       candidatos: dados.projecao.candidatos
     } : null
@@ -160,7 +169,128 @@ async function gravarSnapshot(dados) {
   historicoUltimaGravacao = new Date().toISOString();
   historicoUltimoErro = null;
 
-  return { salvo: true, registradoEm: historicoUltimaGravacao };
+  return {
+    salvo: true,
+    registradoEm: historicoUltimaGravacao
+  };
+}
+
+async function obterResultadoExterior() {
+  if (cache.exterior && Date.now() - cache.exteriorAt < EXTERIOR_CACHE_MS) {
+    return cache.exterior;
+  }
+
+  try {
+    const data = await buscarJson(URL_EXTERIOR_PRESIDENTE, 10000);
+    const result = {
+      ...resumir(data, "zz"),
+      codigo: "ZZ",
+      codigoIBGE: "",
+      municipio: "Exterior",
+      arquivo: URL_EXTERIOR_PRESIDENTE
+    };
+
+    // Só aceitamos a resposta se ela tiver a estrutura esperada.
+    if (!result.eleitoradoApto && !result.secoesTotal && !result.candidatos.length) {
+      throw new Error("O arquivo ZZ não contém estatísticas reconhecíveis.");
+    }
+
+    cache.exterior = result;
+    cache.exteriorAt = Date.now();
+    cache.exteriorError = null;
+    return result;
+  } catch (e) {
+    cache.exteriorError = e.message || String(e);
+    console.error("Falha ao consultar totalização presidencial do exterior:", cache.exteriorError);
+    // Se já houve uma resposta válida, mantém o último valor enquanto a fonte falha.
+    return cache.exterior || null;
+  }
+}
+
+async function obterProjecaoAtual() {
+  const c = await obterConfiguracao();
+
+  const rows = c.municipios
+    .map(m => cache.municipalities.get(`${m.uf}/${m.codigo}`)?.data)
+    .filter(Boolean);
+
+  // ZZ não é município brasileiro. É uma localidade separada, incluída
+  // apenas na projeção presidencial quando o arquivo oficial estiver disponível.
+  const exterior = await obterResultadoExterior();
+  const rowsParaProjecao = exterior ? [...rows, exterior] : rows;
+  const estadosProjetados = UFS.map(uf => {
+    const municipaisUf = rows.filter(m => m.uf === uf);
+    const municipiosUf = c.municipios.filter(m => m.uf === uf);
+    const resumo = projetarMunicipios(municipaisUf, municipiosUf.length);
+    return {
+      uf,
+      estado: NOMES_UF[uf] || uf.toUpperCase(),
+      municipiosComDados: resumo.municipiosComDados,
+      eleitoradoAptoComDados: resumo.eleitoradoApto,
+      eleitoradoTotalizado: resumo.eleitoradoTotalizado,
+      votosApurados: resumo.votosApurados,
+      votosFinaisProjetados: resumo.votosFinaisProjetados,
+      apuracaoVotosPct: resumo.apuracaoVotosPct,
+      candidatos: resumo.candidatos
+    };
+  });
+  const projecao = projetarMunicipios(rowsParaProjecao, c.municipios.length);
+  projecao.estadosProjetados = estadosProjetados;
+
+  return {
+    calculadoEm: new Date().toISOString(),
+    carga: {
+      status: cache.refreshStatus,
+      emAndamento: cache.refreshStarted,
+      municipiosCarregados: rows.length,
+      municipiosConfigurados: c.municipios.length,
+      exteriorDisponivel: Boolean(exterior),
+      exteriorEleitoradoApto: exterior?.eleitoradoApto ?? null,
+      exteriorArquivo: URL_EXTERIOR_PRESIDENTE,
+      exteriorErro: cache.exteriorError
+    },
+    projecao
+  };
+}
+
+async function cicloHistorico() {
+  if (!supabaseConfigurado() || cicloHistoricoEmAndamento) return;
+
+  cicloHistoricoEmAndamento = true;
+
+  try {
+    const brasil = await obterBrasil();
+    const proj = await obterProjecaoAtual();
+
+    const resultado = await gravarSnapshot({
+      eleicao: ELEICAO,
+      consultadoEm: new Date().toISOString(),
+      fonte: "TSE",
+      brasil,
+      ...proj
+    });
+
+    if (resultado.salvo) {
+      console.log(
+        "Snapshot do histórico gravado:",
+        resultado.registradoEm
+      );
+    }
+  } catch (e) {
+    historicoUltimoErro = e.message || String(e);
+    console.error("Falha ao gravar histórico:", historicoUltimoErro);
+  } finally {
+    cicloHistoricoEmAndamento = false;
+  }
+}
+
+function iniciarHistorico() {
+  if (historicoLoopIniciado) return;
+
+  historicoLoopIniciado = true;
+  cicloHistorico();
+
+  setInterval(cicloHistorico, HISTORICO_INTERVAL_MS);
 }
 
 function num(v) {
@@ -221,12 +351,14 @@ async function obterConfiguracao() {
 
       for (const estado of data.abr) {
         const uf = String(estado.cd ?? estado.uf ?? "")
-          .trim().toLowerCase();
+          .trim()
+          .toLowerCase();
 
         if (!UFS.includes(uf) || !Array.isArray(estado.mu)) continue;
 
         for (const m of estado.mu) {
           const codigo = String(m.cd ?? "").trim().padStart(5, "0");
+
           if (!/^\d{5}$/.test(codigo)) continue;
 
           municipios.push({
@@ -238,7 +370,7 @@ async function obterConfiguracao() {
         }
       }
 
-      if (!municipios.length) {
+      if (municipios.length === 0) {
         throw new Error(`Nenhum município encontrado em ${url}`);
       }
 
@@ -305,6 +437,7 @@ function findCandidates(root) {
       if (!id && !name) continue;
 
       const key = id || name;
+
       const item = {
         numero: id,
         nome: name || id,
@@ -314,7 +447,10 @@ function findCandidates(root) {
       };
 
       const old = map.get(key);
-      if (!old || item.votos > old.votos) map.set(key, item);
+
+      if (!old || item.votos > old.votos) {
+        map.set(key, item);
+      }
     }
   });
 
@@ -346,62 +482,6 @@ function resumir(data, uf) {
   };
 }
 
-// Consulta a abrangência ZZ, correspondente ao exterior.
-// O eleitorado é contabilizado separadamente. Os votos só entram
-// na projeção quando há eleitorado efetivamente totalizado.
-async function obterResultadoExterior() {
-  if (
-    cache.exterior &&
-    Date.now() - cache.exteriorAt < EXTERIOR_CACHE_MS
-  ) {
-    return cache.exterior;
-  }
-
-  try {
-    const data = await buscarJson(URL_EXTERIOR_PRESIDENTE);
-    const stats = findStats(data);
-
-    if (
-      !stats?.s ||
-      !stats?.e ||
-      !Array.isArray(data?.carg)
-    ) {
-      throw new Error(
-        `Formato inesperado no arquivo do exterior: ${URL_EXTERIOR_PRESIDENTE}`
-      );
-    }
-
-    const resultado = {
-      consultado: true,
-      disponivel: true,
-      estruturaValida: true,
-      arquivo: URL_EXTERIOR_PRESIDENTE,
-      dados: {
-        ...resumir(data, "zz"),
-        municipio: "Exterior"
-      },
-      erro: null
-    };
-
-    cache.exterior = resultado;
-    cache.exteriorAt = Date.now();
-    return resultado;
-  } catch (e) {
-    const resultado = {
-      consultado: true,
-      disponivel: false,
-      estruturaValida: false,
-      arquivo: URL_EXTERIOR_PRESIDENTE,
-      dados: null,
-      erro: e.message || String(e)
-    };
-
-    cache.exterior = resultado;
-    cache.exteriorAt = Date.now();
-    return resultado;
-  }
-}
-
 async function obterResultadoMunicipal(m) {
   const key = `${m.uf}/${m.codigo}`;
   const old = cache.municipalities.get(key);
@@ -423,7 +503,11 @@ async function obterResultadoMunicipal(m) {
     arquivo: url
   };
 
-  cache.municipalities.set(key, { at: Date.now(), data: result });
+  cache.municipalities.set(key, {
+    at: Date.now(),
+    data: result
+  });
+
   return result;
 }
 
@@ -436,12 +520,14 @@ async function atualizarCacheMunicipal() {
   try {
     const config = await obterConfiguracao();
     const rows = config.municipios;
+
     let success = 0;
     let failed = 0;
     const concurrency = 5;
 
     for (let i = 0; i < rows.length; i += concurrency) {
       const batch = rows.slice(i, i + concurrency);
+
       const results = await Promise.allSettled(
         batch.map(obterResultadoMunicipal)
       );
@@ -466,136 +552,137 @@ async function atualizarCacheMunicipal() {
   }
 }
 
-function projetarMunicipios(rows, totalConfigurado = rows.length, exterior = null) {
+function projetarMunicipios(rows, totalConfigurado = rows.length) {
+  // A projeção usa votos observados por eleitorado das seções já totalizadas.
+  // Seções/urnas nunca entram na fórmula de cobertura de votos.
+  const usable = rows.filter(m => m && m.eleitoradoApto > 0);
+  const observed = usable.filter(m =>
+    m.eleitoradoTotalizado > 0 &&
+    (m.votosValidos + m.votosBrancos + m.votosNulos) > 0
+  );
+
+  const aggregate = list => {
+    const electorate = list.reduce((s,m)=>s + Math.max(0,m.eleitoradoTotalizado||0),0);
+    const ballots = list.reduce((s,m)=>s + Math.max(0,(m.votosValidos||0)+(m.votosBrancos||0)+(m.votosNulos||0)),0);
+    const valid = list.reduce((s,m)=>s + Math.max(0,m.votosValidos||0),0);
+    const white = list.reduce((s,m)=>s + Math.max(0,m.votosBrancos||0),0);
+    const nul = list.reduce((s,m)=>s + Math.max(0,m.votosNulos||0),0);
+    const candidateVotes = new Map();
+    for (const m of list) for (const c of (m.candidatos||[])) {
+      const key = c.numero || c.nome;
+      const old = candidateVotes.get(key) || {numero:c.numero,nome:c.nome,partido:c.partido,votos:0};
+      old.votos += Math.max(0,c.votos||0);
+      candidateVotes.set(key,old);
+    }
+    const candTotal = [...candidateVotes.values()].reduce((s,c)=>s+c.votos,0);
+    return {
+      electorate, ballots, valid, white, nul,
+      turnout: electorate > 0 ? Math.min(1,ballots/electorate) : null,
+      validShare: ballots > 0 ? valid/ballots : null,
+      whiteShare: ballots > 0 ? white/ballots : null,
+      nullShare: ballots > 0 ? nul/ballots : null,
+      candidateShares: new Map([...candidateVotes].map(([k,c])=>[k,{
+        ...c, share: candTotal>0?c.votos/candTotal:0
+      }]))
+    };
+  };
+
+  const nationalObserved = aggregate(observed);
+  const byUf = new Map();
+  for (const uf of UFS) byUf.set(uf, aggregate(observed.filter(m=>m.uf===uf)));
+  const fallbackTurnout = nationalObserved.turnout;
+  const fallbackValid = nationalObserved.validShare;
+  const fallbackWhite = nationalObserved.whiteShare;
+  const fallbackNull = nationalObserved.nullShare;
+  const fallbackCandidates = nationalObserved.candidateShares;
+
+  let eligible = 0, electorateWithResults = 0;
+  let officialValid = 0, officialWhite = 0, officialNull = 0;
+  let projectedBallots = 0, projectedValid = 0, projectedWhite = 0, projectedNull = 0;
+  let projectedAbstention = 0, observedBallots = 0, municipalitiesWithVotes = 0;
+  let totalSections = 0, countedSections = 0;
   const byCandidate = new Map();
+  let exteriorComDados = false;
 
-  let eligible = 0;
-  let countedElectorate = 0;
-  let totalSections = 0;
-  let countedSections = 0;
-  let officialValid = 0;
-  let officialWhite = 0;
-  let officialNull = 0;
-  let projectedValid = 0;
-  let projectedWhite = 0;
-  let projectedNull = 0;
-  let projectedAbstention = 0;
-  let municipalitiesLoaded = 0;
+  for (const m of usable) {
+    const apto = Math.max(0,m.eleitoradoApto||0);
+    const eTotalizado = Math.max(0,m.eleitoradoTotalizado||0);
+    const valid = Math.max(0,m.votosValidos||0);
+    const white = Math.max(0,m.votosBrancos||0);
+    const nul = Math.max(0,m.votosNulos||0);
+    const ballots = valid + white + nul;
+    eligible += apto;
+    electorateWithResults += eTotalizado;
+    totalSections += Math.max(0,m.secoesTotal||0);
+    countedSections += Math.max(0,m.secoesTotalizadas||0);
+    officialValid += valid; officialWhite += white; officialNull += nul;
+    observedBallots += ballots;
 
-  for (const m of rows) {
-    eligible += m.eleitoradoApto;
-    countedElectorate += m.eleitoradoTotalizado;
-    totalSections += m.secoesTotal;
-    countedSections += m.secoesTotalizadas;
-    officialValid += m.votosValidos;
-    officialWhite += m.votosBrancos;
-    officialNull += m.votosNulos;
+    const hasLocal = eTotalizado > 0 && ballots > 0 && (m.candidatos||[]).length > 0;
+    if (hasLocal) {
+      if (m.uf === 'zz') exteriorComDados = true;
+      else municipalitiesWithVotes++;
+    }
 
-    if (
-      !m.eleitoradoApto ||
-      !m.eleitoradoTotalizado ||
-      !m.candidatos.length
-    ) continue;
+    const ufStats = byUf.get(m.uf);
+    const turnout = hasLocal
+      ? Math.min(1, ballots / eTotalizado)
+      : (ufStats?.turnout ?? fallbackTurnout);
+    const validShare = hasLocal
+      ? (ballots > 0 ? valid / ballots : fallbackValid)
+      : (ufStats?.validShare ?? fallbackValid);
+    const whiteShare = hasLocal
+      ? (ballots > 0 ? white / ballots : fallbackWhite)
+      : (ufStats?.whiteShare ?? fallbackWhite);
+    const nullShare = hasLocal
+      ? (ballots > 0 ? nul / ballots : fallbackNull)
+      : (ufStats?.nullShare ?? fallbackNull);
+    const candidateShares = hasLocal
+      ? new Map((m.candidatos||[]).map(c=>[c.numero||c.nome,{
+          numero:c.numero,nome:c.nome,partido:c.partido,
+          share:(m.candidatos||[]).reduce((sum,x)=>sum+Math.max(0,x.votos||0),0)>0
+            ? Math.max(0,c.votos||0)/(m.candidatos||[]).reduce((sum,x)=>sum+Math.max(0,x.votos||0),0) : 0
+        }]))
+      : ((ufStats?.candidateShares?.size ? ufStats.candidateShares : fallbackCandidates) || new Map());
 
-    const countedBallots =
-      m.votosValidos + m.votosBrancos + m.votosNulos;
+    // Se ainda não há qualquer resultado no país, não há base estatística para projetar.
+    if (turnout === null || validShare === null || !candidateShares.size) continue;
+    const ballotsFinal = apto * turnout;
+    const validFinal = ballotsFinal * validShare;
+    const whiteFinal = ballotsFinal * (whiteShare ?? 0);
+    const nullFinal = ballotsFinal * (nullShare ?? 0);
+    projectedBallots += ballotsFinal;
+    projectedValid += validFinal;
+    projectedWhite += whiteFinal;
+    projectedNull += nullFinal;
+    projectedAbstention += Math.max(0,apto-ballotsFinal);
 
-    if (countedBallots <= 0) continue;
-
-    municipalitiesLoaded++;
-
-    const factor = m.eleitoradoApto / m.eleitoradoTotalizado;
-    const projectedVoters = countedBallots * factor;
-
-    projectedValid += m.votosValidos * factor;
-    projectedWhite += m.votosBrancos * factor;
-    projectedNull += m.votosNulos * factor;
-    projectedAbstention += Math.max(
-      0,
-      m.eleitoradoApto - projectedVoters
-    );
-
-    for (const c of m.candidatos) {
-      const key = c.numero || c.nome;
+    for (const [key,share] of candidateShares) {
       const old = byCandidate.get(key) || {
-        numero: c.numero,
-        nome: c.nome,
-        partido: c.partido,
-        votosOficiais: 0,
-        votosProjetados: 0
+        numero:share.numero, nome:share.nome, partido:share.partido,
+        votosOficiais:0, votosProjetados:0
       };
-
-      old.votosOficiais += c.votos;
-      old.votosProjetados += c.votos * factor;
-      byCandidate.set(key, old);
+      const localCandidate = (m.candidatos||[]).find(c=>(c.numero||c.nome)===key);
+      if (localCandidate) old.votosOficiais += Math.max(0,localCandidate.votos||0);
+      old.votosProjetados += validFinal * Math.max(0,share.share||0);
+      byCandidate.set(key,old);
     }
   }
 
-  const eleitoradoExterior =
-    exterior?.disponivel && exterior?.estruturaValida
-      ? num(exterior.dados?.eleitoradoApto)
-      : 0;
-
-  const exteriorApurado = Boolean(
-    exterior?.disponivel &&
-    exterior?.estruturaValida &&
-    num(exterior.dados?.eleitoradoTotalizado) > 0
-  );
-
-  if (exteriorApurado) {
-    const ext = exterior.dados;
-
-    officialValid += num(ext.votosValidos);
-    officialWhite += num(ext.votosBrancos);
-    officialNull += num(ext.votosNulos);
-
-    projectedValid += num(ext.votosValidos);
-    projectedWhite += num(ext.votosBrancos);
-    projectedNull += num(ext.votosNulos);
-
-    for (const c of ext.candidatos || []) {
-      const key = c.numero || c.nome;
-      const old = byCandidate.get(key) || {
-        numero: c.numero,
-        nome: c.nome,
-        partido: c.partido,
-        votosOficiais: 0,
-        votosProjetados: 0
-      };
-
-      old.votosOficiais += num(c.votos);
-      old.votosProjetados += num(c.votos);
-      byCandidate.set(key, old);
-    }
-  }
-
-  const candidates = [...byCandidate.values()]
-    .sort((a, b) => b.votosProjetados - a.votosProjetados);
-
-  const totalCandidateVotes = candidates.reduce(
-    (sum, c) => sum + c.votosProjetados,
-    0
-  );
-
-  for (const c of candidates) {
-    c.percentualProjetado = pct(c.votosProjetados, totalCandidateVotes);
-  }
+  const candidates = [...byCandidate.values()].sort((a,b)=>b.votosProjetados-a.votosProjetados);
+  const candidateTotal = candidates.reduce((s,c)=>s+c.votosProjetados,0);
+  for (const c of candidates) c.percentualProjetado = pct(c.votosProjetados,candidateTotal);
 
   return {
     eleitoradoApto: eligible,
-    eleitoradoMunicipiosBrasil: eligible,
-    eleitoradoExterior,
-    eleitoradoTotalBruto: eligible + eleitoradoExterior,
-    eleitoradoReferenciaNacional: ELEITORADO_REFERENCIA_NACIONAL,
-    diferencaEleitoradoReferencia:
-      eligible + eleitoradoExterior - ELEITORADO_REFERENCIA_NACIONAL,
-
-    eleitoradoTotalizado: countedElectorate,
-    apuracaoEleitoradoPct: pct(countedElectorate, eligible),
+    eleitoradoTotalizado: electorateWithResults,
+    apuracaoEleitoradoPct: pct(electorateWithResults,eligible), // informativo; não é avanço da projeção
+    votosApurados: observedBallots,
+    votosFinaisProjetados: projectedBallots,
+    apuracaoVotosPct: projectedBallots > 0 ? Math.min(100,pct(observedBallots,projectedBallots)) : null,
     secoesTotal: totalSections,
     secoesTotalizadas: countedSections,
-    apuracaoSecoesPct: pct(countedSections, totalSections),
-
+    apuracaoSecoesPct: pct(countedSections,totalSections), // apenas diagnóstico operacional
     votosValidosOficiais: officialValid,
     votosBrancosOficiais: officialWhite,
     votosNulosOficiais: officialNull,
@@ -603,47 +690,13 @@ function projetarMunicipios(rows, totalConfigurado = rows.length, exterior = nul
     votosBrancosProjetados: projectedWhite,
     votosNulosProjetados: projectedNull,
     abstencoesProjetadas: projectedAbstention,
-
-    exteriorDisponivel: Boolean(
-      exterior?.disponivel && exterior?.estruturaValida
-    ),
-    exteriorApurado,
-
     candidatos: candidates,
     municipiosConfigurados: totalConfigurado,
-    municipiosComDados: municipalitiesLoaded,
-    municipiosPendentes: Math.max(
-      0,
-      totalConfigurado - municipalitiesLoaded
-    ),
-
-    observacao:
-      "Estimativa preliminar baseada nos municípios com dados válidos. " +
-      "O eleitorado do exterior é informado separadamente. " +
-      "Votos internacionais só são incorporados quando há apuração. " +
-      "A referência nacional permanece fixa em 158.745.463. " +
-      "O total bruto pode divergir da referência e não é resultado oficial."
-  };
-}
-
-async function obterProjecaoAtual() {
-  const c = await obterConfiguracao();
-
-  const rows = c.municipios
-    .map(m => cache.municipalities.get(`${m.uf}/${m.codigo}`)?.data)
-    .filter(Boolean);
-
-  const exterior = await obterResultadoExterior();
-
-  return {
-    calculadoEm: new Date().toISOString(),
-    carga: {
-      status: cache.refreshStatus,
-      emAndamento: cache.refreshStarted,
-      municipiosCarregados: rows.length,
-      municipiosConfigurados: c.municipios.length
-    },
-    projecao: projetarMunicipios(rows, c.municipios.length, exterior)
+    municipiosComDados: municipalitiesWithVotes,
+    municipiosPendentes: Math.max(0,totalConfigurado-municipalitiesWithVotes),
+    exteriorComDados,
+    metodo: "Projeção municipal por taxa de comparecimento e composição de votos observadas; localidades sem resultados usam a média estadual e, quando indisponível, nacional.",
+    observacao: "A cobertura de apuração é votos apurados divididos pelo total de votos finais estimado. Urnas e seções não entram nessa fórmula. Estimativas preliminares não são resultados oficiais."
   };
 }
 
@@ -652,7 +705,7 @@ async function obterBrasil() {
     return { ...cache.national, cache: true };
   }
 
-  const [tracking, president, stateResults, exterior] = await Promise.all([
+  const [tracking, president, stateResults] = await Promise.all([
     buscarJson(URL_NACIONAL_ACOMP)
       .then(value => ({ status: "fulfilled", value }))
       .catch(reason => ({ status: "rejected", reason })),
@@ -664,14 +717,17 @@ async function obterBrasil() {
     Promise.allSettled(UFS.map(async uf => {
       const url = `${BASE}/dados/${uf}/${uf}-e${ELEICAO_ARQ}-ab.json`;
       const data = await buscarJson(url, 8000);
-      return { ...resumir(data, uf), arquivo: url };
-    })),
 
-    obterResultadoExterior()
+      return {
+        ...resumir(data, uf),
+        arquivo: url
+      };
+    }))
   ]);
 
   const trackingData =
     tracking.status === "fulfilled" ? tracking.value : null;
+
   const presidentData =
     president.status === "fulfilled" ? president.value : null;
 
@@ -714,12 +770,11 @@ async function obterBrasil() {
     arquivos: {
       acompanhamento: URL_NACIONAL_ACOMP,
       resultadoPresidencial: URL_NACIONAL_PRESIDENTE,
-      resultadoExterior: URL_EXTERIOR_PRESIDENTE,
+      resultadoPresidencialExterior: URL_EXTERIOR_PRESIDENTE,
       configuracoesMunicipais: CONFIG_URLS
     },
     oficial: trackingData ? resumir(trackingData, "br") : null,
     candidatosOficiais: presidentData ? findCandidates(presidentData) : [],
-    exterior,
     estados,
     falhasEstados,
     configuracao: {
@@ -739,41 +794,6 @@ async function obterBrasil() {
   cache.nationalAt = Date.now();
 
   return { ...result, cache: false };
-}
-
-async function cicloHistorico() {
-  if (!supabaseConfigurado() || cicloHistoricoEmAndamento) return;
-
-  cicloHistoricoEmAndamento = true;
-
-  try {
-    const brasil = await obterBrasil();
-    const proj = await obterProjecaoAtual();
-
-    const resultado = await gravarSnapshot({
-      eleicao: ELEICAO,
-      consultadoEm: new Date().toISOString(),
-      fonte: "TSE",
-      brasil,
-      ...proj
-    });
-
-    if (resultado.salvo) {
-      console.log("Snapshot do histórico gravado:", resultado.registradoEm);
-    }
-  } catch (e) {
-    historicoUltimoErro = e.message || String(e);
-    console.error("Falha ao gravar histórico:", historicoUltimoErro);
-  } finally {
-    cicloHistoricoEmAndamento = false;
-  }
-}
-
-function iniciarHistorico() {
-  if (historicoLoopIniciado) return;
-  historicoLoopIniciado = true;
-  cicloHistorico();
-  setInterval(cicloHistorico, HISTORICO_INTERVAL_MS);
 }
 
 app.get("/", (_req, res) => {
@@ -802,12 +822,9 @@ app.get("/api/status", (_req, res) => {
     cargaMunicipal: cache.refreshStatus,
     exterior: {
       arquivo: URL_EXTERIOR_PRESIDENTE,
-      consultado: cache.exterior !== null,
-      disponivel: cache.exterior?.disponivel ?? null,
-      estruturaValida: cache.exterior?.estruturaValida ?? null,
-      eleitoradoApto: cache.exterior?.dados?.eleitoradoApto ?? null,
-      eleitoradoTotalizado: cache.exterior?.dados?.eleitoradoTotalizado ?? null,
-      erro: cache.exterior?.erro ?? null
+      disponivel: Boolean(cache.exterior),
+      eleitoradoApto: cache.exterior?.eleitoradoApto ?? null,
+      erro: cache.exteriorError
     },
     historico: {
       configurado: supabaseConfigurado(),
@@ -826,7 +843,11 @@ app.get("/api/historico", async (req, res, next) => {
       });
     }
 
-    const rawLimit = Number.parseInt(String(req.query.limit || "100"), 10);
+    const rawLimit = Number.parseInt(
+      String(req.query.limit || "100"),
+      10
+    );
+
     const limit = Number.isFinite(rawLimit)
       ? Math.max(1, Math.min(500, rawLimit))
       : 100;
@@ -904,7 +925,10 @@ app.get("/api/municipio/:uf/:codigo", async (req, res, next) => {
       });
     }
 
-    res.json({ ok: true, ...await obterResultadoMunicipal(m) });
+    res.json({
+      ok: true,
+      ...await obterResultadoMunicipal(m)
+    });
   } catch (e) {
     next(e);
   }
@@ -931,7 +955,10 @@ app.get("/api/projecao", async (_req, res, next) => {
       carga: atual.carga,
       projecao: atual.projecao,
       historicoDisponivel: null,
-      observacao: atual.projecao.observacao
+      observacao:
+        "Estimativa preliminar baseada nos municípios com dados válidos. " +
+        "Municípios sem dados não recebem votos inventados. " +
+        "A projeção não deve ser interpretada como resultado oficial."
     };
 
     try {
@@ -945,6 +972,7 @@ app.get("/api/projecao", async (_req, res, next) => {
 
       payload.historicoDisponivel =
         gravacao.salvo || historicoUltimaGravacao !== null;
+
       payload.historicoGravacao = gravacao;
     } catch (e) {
       historicoUltimoErro = e.message || String(e);
@@ -960,6 +988,7 @@ app.get("/api/projecao", async (_req, res, next) => {
 
 app.use((err, _req, res, _next) => {
   console.error("Erro no coletor:", err);
+
   res.status(502).json({
     ok: false,
     erro: err.message || "Erro no coletor",
@@ -969,6 +998,8 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`Projeção Brasil API ouvindo na porta ${PORT}`);
+
+  // Inicia a carga municipal e a gravação do histórico em segundo plano.
   atualizarCacheMunicipal();
   iniciarHistorico();
 });
