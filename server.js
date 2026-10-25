@@ -6,17 +6,9 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
-const ELECTION_ID = "6258";
-const BASE = `https://resultados.tse.jus.br/oficial/ele2026/${ELECTION_ID}`;
-const CONFIG_URL = `${BASE}/config/mun-e${ELECTION_ID}-cm.json`;
-
-const CACHE = {
-  config: null,
-  configAt: 0,
-  municipalityResults: new Map(),
-  national: null,
-  nationalAt: 0
-};
+const ELEICAO = "6258";
+const BASE = `https://resultados.tse.jus.br/oficial/ele2026/${ELEICAO}`;
+const CONFIG_URL = `${BASE}/config/mun-e${ELEICAO}-cm.json`;
 
 const UFS = [
   "ac", "al", "am", "ap", "ba", "ce", "df", "es", "go",
@@ -24,16 +16,25 @@ const UFS = [
   "rj", "rn", "ro", "rr", "rs", "sc", "se", "sp", "to"
 ];
 
-const UF_NAMES = {
+const NOMES_UF = {
   ac: "Acre", al: "Alagoas", am: "Amazonas", ap: "Amapá",
   ba: "Bahia", ce: "Ceará", df: "Distrito Federal",
   es: "Espírito Santo", go: "Goiás", ma: "Maranhão",
-  mg: "Minas Gerais", ms: "Mato Grosso do Sul", mt: "Mato Grosso",
-  pa: "Pará", pb: "Paraíba", pe: "Pernambuco", pi: "Piauí",
-  pr: "Paraná", rj: "Rio de Janeiro", rn: "Rio Grande do Norte",
+  mg: "Minas Gerais", ms: "Mato Grosso do Sul",
+  mt: "Mato Grosso", pa: "Pará", pb: "Paraíba",
+  pe: "Pernambuco", pi: "Piauí", pr: "Paraná",
+  rj: "Rio de Janeiro", rn: "Rio Grande do Norte",
   ro: "Rondônia", rr: "Roraima", rs: "Rio Grande do Sul",
   sc: "Santa Catarina", se: "Sergipe", sp: "São Paulo",
   to: "Tocantins"
+};
+
+const cache = {
+  configuracao: null,
+  configuracaoEm: 0,
+  municipios: new Map(),
+  brasil: null,
+  brasilEm: 0
 };
 
 app.use((req, res, next) => {
@@ -48,36 +49,36 @@ app.use((req, res, next) => {
   next();
 });
 
-function toNumber(value) {
-  if (value === undefined || value === null || value === "") {
+function numero(valor) {
+  if (valor === undefined || valor === null || valor === "") {
     return 0;
   }
 
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : 0;
+  if (typeof valor === "number") {
+    return Number.isFinite(valor) ? valor : 0;
   }
 
-  const raw = String(value).trim();
+  const texto = String(valor).trim();
 
-  const normalized = raw.includes(",")
-    ? raw.replace(/\./g, "").replace(",", ".")
-    : raw.replace(/\./g, "");
+  const normalizado = texto.includes(",")
+    ? texto.replace(/\./g, "").replace(",", ".")
+    : texto.replace(/\./g, "");
 
-  const parsed = Number(normalized);
+  const resultado = Number(normalizado);
 
-  return Number.isFinite(parsed) ? parsed : 0;
+  return Number.isFinite(resultado) ? resultado : 0;
 }
 
-function percent(part, total) {
-  return total > 0 ? (part / total) * 100 : 0;
+function percentual(parte, total) {
+  return total > 0 ? (parte / total) * 100 : 0;
 }
 
-async function fetchJson(url, timeoutMs = 12000) {
+async function buscarJson(url, timeoutMs = 12000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(url, {
+    const resposta = await fetch(url, {
       signal: controller.signal,
       headers: {
         "User-Agent": "ProjecaoBrasil/1.0"
@@ -85,455 +86,271 @@ async function fetchJson(url, timeoutMs = 12000) {
       cache: "no-store"
     });
 
-    if (!response.ok) {
-      throw new Error(
-        `TSE respondeu HTTP ${response.status} ao consultar ${url}`
-      );
+    if (!resposta.ok) {
+      throw new Error(`TSE respondeu HTTP ${resposta.status}`);
     }
 
-    return await response.json();
+    return await resposta.json();
   } finally {
     clearTimeout(timer);
   }
 }
 
-function getUfCode(record) {
-  return String(record?.cd ?? record?.uf ?? "")
-    .trim()
-    .toLowerCase();
-}
-
-async function getMunicipalityConfig() {
-  const ttlMs = 60 * 60 * 1000;
-
-  if (CACHE.config && Date.now() - CACHE.configAt < ttlMs) {
-    return CACHE.config;
+async function obterConfiguracao() {
+  if (
+    cache.configuracao &&
+    Date.now() - cache.configuracaoEm < 3600000
+  ) {
+    return cache.configuracao;
   }
 
-  const data = await fetchJson(CONFIG_URL);
+  const dados = await buscarJson(CONFIG_URL);
 
-  if (!Array.isArray(data?.abr)) {
-    throw new Error(
-      "A configuração municipal recebida do TSE não contém a lista esperada."
-    );
+  if (!Array.isArray(dados?.abr)) {
+    throw new Error("Formato inesperado da configuração municipal do TSE.");
   }
 
-  const municipalities = [];
+  const municipios = [];
 
-  for (const state of data.abr) {
-    const uf = getUfCode(state);
+  for (const estado of dados.abr) {
+    const uf = String(estado.cd ?? estado.uf ?? "")
+      .trim()
+      .toLowerCase();
 
-    if (!Array.isArray(state.mu)) {
-      continue;
-    }
+    if (!Array.isArray(estado.mu)) continue;
 
-    for (const municipality of state.mu) {
-      municipalities.push({
+    for (const municipio of estado.mu) {
+      municipios.push({
         uf,
-        codigo: String(municipality.cd ?? "")
+        codigo: String(municipio.cd ?? "")
           .trim()
           .padStart(5, "0"),
-        ibge: String(municipality.cdi ?? "").trim(),
-        nome: String(municipality.nm ?? "").trim(),
-        zonas: Array.isArray(municipality.z)
-          ? municipality.z
-          : []
+        codigoIBGE: String(municipio.cdi ?? "").trim(),
+        nome: String(municipio.nm ?? "").trim()
       });
     }
   }
 
-  CACHE.config = {
-    geracao: data.idg ?? null,
-    data: data.dg ?? null,
-    hora: data.hg ?? null,
-    municipios: municipalities
+  cache.configuracao = {
+    geracao: dados.idg ?? null,
+    data: dados.dg ?? null,
+    hora: dados.hg ?? null,
+    municipios
   };
 
-  CACHE.configAt = Date.now();
+  cache.configuracaoEm = Date.now();
 
-  return CACHE.config;
+  return cache.configuracao;
 }
 
-function validateMunicipalityParams(ufInput, codeInput) {
-  const uf = String(ufInput ?? "").trim().toLowerCase();
-  const codigo = String(codeInput ?? "")
-    .trim()
-    .padStart(5, "0");
+function localizarObjetos(raiz, criterio) {
+  const encontrados = [];
+  const visitados = new Set();
 
-  if (!UFS.includes(uf) || !/^\d{5}$/.test(codigo)) {
-    const error = new Error("UF ou código municipal inválido.");
-    error.status = 400;
-    throw error;
-  }
-
-  return { uf, codigo };
-}
-
-async function getMunicipalityResult(ufInput, codeInput) {
-  const { uf, codigo } = validateMunicipalityParams(
-    ufInput,
-    codeInput
-  );
-
-  const key = `${uf}/${codigo}`;
-  const ttlMs = 45 * 1000;
-  const cached = CACHE.municipalityResults.get(key);
-
-  if (cached && Date.now() - cached.at < ttlMs) {
-    return {
-      ...cached.value,
-      cache: true
-    };
-  }
-
-  const url =
-    `${BASE}/dados/${uf}/${uf}${codigo}-c0001-e${ELECTION_ID}-u.json`;
-
-  const data = await fetchJson(url);
-  const config = await getMunicipalityConfig();
-
-  const entry = config.municipios.find(
-    item => item.uf === uf && item.codigo === codigo
-  );
-
-  const value = {
-    ok: true,
-    fonte: "TSE",
-    eleicao: ELECTION_ID,
-    turno: 2,
-    municipio:
-      entry?.nome ||
-      String(data?.nmabr ?? data?.cdabr ?? codigo),
-    uf,
-    codigo,
-    codigoIBGE: entry?.ibge || null,
-    arquivo: url,
-    consultadoEm: new Date().toISOString(),
-    geracao: data?.idg ?? null,
-    dados: data
-  };
-
-  CACHE.municipalityResults.set(key, {
-    at: Date.now(),
-    value
-  });
-
-  return {
-    ...value,
-    cache: false
-  };
-}
-
-function walkObjects(
-  root,
-  callback,
-  depth = 0,
-  seen = new Set()
-) {
-  if (
-    !root ||
-    typeof root !== "object" ||
-    depth > 14 ||
-    seen.has(root)
-  ) {
-    return;
-  }
-
-  seen.add(root);
-  callback(root);
-
-  if (Array.isArray(root)) {
-    for (const item of root) {
-      walkObjects(item, callback, depth + 1, seen);
-    }
-
-    return;
-  }
-
-  for (const value of Object.values(root)) {
-    walkObjects(value, callback, depth + 1, seen);
-  }
-}
-
-function findStatisticsObject(root) {
-  let found = null;
-
-  walkObjects(root, object => {
+  function percorrer(objeto, profundidade = 0) {
     if (
-      !found &&
-      !Array.isArray(object) &&
-      object.s &&
-      object.e
+      !objeto ||
+      typeof objeto !== "object" ||
+      profundidade > 12 ||
+      visitados.has(objeto)
     ) {
-      found = object;
-    }
-  });
-
-  return found || {};
-}
-
-function extractCandidates(root) {
-  const found = new Map();
-
-  walkObjects(root, object => {
-    if (!Array.isArray(object) || !object.length) {
       return;
     }
 
-    for (const candidate of object) {
-      if (!candidate || typeof candidate !== "object") {
-        continue;
-      }
+    visitados.add(objeto);
 
-      const hasVoteFields =
-        candidate.vap !== undefined ||
-        candidate.pvap !== undefined;
-
-      if (!hasVoteFields) {
-        continue;
-      }
-
-      const number = String(
-        candidate.n ?? candidate.sqcand ?? ""
-      ).trim();
-
-      if (!number) {
-        continue;
-      }
-
-      const candidateData = {
-        numero: number,
-        nome: String(
-          candidate.nm ?? candidate.nmu ?? number
-        ).trim(),
-        votos: toNumber(candidate.vap),
-        percentual: toNumber(candidate.pvap)
-      };
-
-      const previous = found.get(number);
-
-      if (
-        !previous ||
-        candidateData.votos > previous.votos
-      ) {
-        found.set(number, candidateData);
-      }
+    if (!Array.isArray(objeto) && criterio(objeto)) {
+      encontrados.push(objeto);
     }
-  });
 
-  return [...found.values()].sort(
-    (a, b) => b.votos - a.votos
-  );
-}
-
-function summarizeState(data, uf) {
-  const stats = findStatisticsObject(data);
-  const s = stats.s || {};
-  const e = stats.e || {};
-  const v = stats.v || {};
-
-  const totalSections = toNumber(s.ts);
-  const countedSections = toNumber(s.st);
-  const eligibleElectorate = toNumber(e.te);
-  const countedElectorate = toNumber(e.est);
-
-  return {
-    uf,
-    estado: UF_NAMES[uf] || uf.toUpperCase(),
-    geracao: data?.idg ?? null,
-    dataGeracao: data?.dg ?? null,
-    horaGeracao: data?.hg ?? null,
-
-    secoesTotal: totalSections,
-    secoesTotalizadas: countedSections,
-    apuracaoSecoesPct: percent(
-      countedSections,
-      totalSections
-    ),
-
-    eleitoradoApto: eligibleElectorate,
-    eleitoradoTotalizado: countedElectorate,
-    apuracaoEleitoradoPct: percent(
-      countedElectorate,
-      eligibleElectorate
-    ),
-
-    votosValidos: toNumber(v.vvc),
-    votosBrancos: toNumber(v.vb),
-    votosNulos: toNumber(v.vn),
-
-    candidatos: extractCandidates(data)
-  };
-}
-
-async function getStateResult(uf) {
-  const urls = [
-    `${BASE}/dados/${uf}/${uf}-e${ELECTION_ID}-ab.json`,
-    `${BASE}/dados/${uf}/${uf}-e${ELECTION_ID}-u.json`
-  ];
-
-  let lastError;
-
-  for (const url of urls) {
-    try {
-      return {
-        data: await fetchJson(url, 8000),
-        arquivo: url
-      };
-    } catch (error) {
-      lastError = error;
+    if (Array.isArray(objeto)) {
+      for (const item of objeto) {
+        percorrer(item, profundidade + 1);
+      }
+    } else {
+      for (const valor of Object.values(objeto)) {
+        percorrer(valor, profundidade + 1);
+      }
     }
   }
 
-  throw lastError ||
-    new Error(
-      `Não foi possível obter os dados de ${uf.toUpperCase()}.`
-    );
+  percorrer(raiz);
+  return encontrados;
 }
 
-async function getBrazilSummary() {
-  const ttlMs = 25 * 1000;
+function resumirEstado(dados, uf) {
+  const objetos = localizarObjetos(
+    dados,
+    objeto => objeto.s && objeto.e
+  );
 
+  const estatisticas = objetos[0] || {};
+  const secoes = estatisticas.s || {};
+  const eleitorado = estatisticas.e || {};
+  const votos = estatisticas.v || {};
+
+  const totalSecoes = numero(secoes.ts);
+  const secoesTotalizadas = numero(secoes.st);
+  const totalEleitores = numero(eleitorado.te);
+  const eleitoresTotalizados = numero(eleitorado.est);
+
+  return {
+    uf,
+    estado: NOMES_UF[uf] || uf.toUpperCase(),
+    geracao: dados?.idg ?? null,
+    dataGeracao: dados?.dg ?? null,
+    horaGeracao: dados?.hg ?? null,
+
+    secoesTotal: totalSecoes,
+    secoesTotalizadas,
+    apuracaoSecoesPct: percentual(
+      secoesTotalizadas,
+      totalSecoes
+    ),
+
+    eleitoradoApto: totalEleitores,
+    eleitoradoTotalizado: eleitoresTotalizados,
+    apuracaoEleitoradoPct: percentual(
+      eleitoresTotalizados,
+      totalEleitores
+    ),
+
+    votosValidos: numero(votos.vvc),
+    votosBrancos: numero(votos.vb),
+    votosNulos: numero(votos.vn)
+  };
+}
+
+async function buscarResultadoEstadual(uf) {
+  const urls = [
+    `${BASE}/dados/${uf}/${uf}-e${ELEICAO}-ab.json`,
+    `${BASE}/dados/${uf}/${uf}-e${ELEICAO}-u.json`
+  ];
+
+  let ultimoErro;
+
+  for (const url of urls) {
+    try {
+      const dados = await buscarJson(url, 8000);
+
+      return {
+        ...resumirEstado(dados, uf),
+        arquivo: url
+      };
+    } catch (erro) {
+      ultimoErro = erro;
+    }
+  }
+
+  throw new Error(
+    `${uf.toUpperCase()}: ${
+      ultimoErro?.message || "arquivos estaduais indisponíveis"
+    }`
+  );
+}
+
+async function obterBrasil() {
   if (
-    CACHE.national &&
-    Date.now() - CACHE.nationalAt < ttlMs
+    cache.brasil &&
+    Date.now() - cache.brasilEm < 25000
   ) {
     return {
-      ...CACHE.national,
+      ...cache.brasil,
       cache: true
     };
   }
 
-  const startedAt = Date.now();
+  const inicio = Date.now();
+  const urlNacional = `${BASE}/dados/br/br-e${ELEICAO}-ab.json`;
 
-  const nationalUrl =
-    `${BASE}/dados/br/br-e${ELECTION_ID}-ab.json`;
-
-  let nationalFile = null;
-  let nationalError = null;
+  let arquivoNacional = null;
+  let erroNacional = null;
 
   try {
-    nationalFile = await fetchJson(nationalUrl, 10000);
-  } catch (error) {
-    nationalError = error.message;
+    arquivoNacional = await buscarJson(urlNacional, 10000);
+  } catch (erro) {
+    erroNacional = erro.message;
   }
 
-  const settled = await Promise.allSettled(
-    UFS.map(async uf => {
-      const result = await getStateResult(uf);
-
-      return {
-        ...summarizeState(result.data, uf),
-        arquivo: result.arquivo
-      };
-    })
+  const consultas = await Promise.allSettled(
+    UFS.map(uf => buscarResultadoEstadual(uf))
   );
 
-  const states = [];
-  const failures = [];
+  const estados = [];
+  const listaFalhas = [];
 
-  settled.forEach((result, index) => {
-    if (result.status === "fulfilled") {
-      states.push(result.value);
+  for (let i = 0; i < consultas.length; i++) {
+    const resultado = consultas[i];
+
+    if (resultado.status === "fulfilled") {
+      estados.push(resultado.value);
     } else {
-      failures.push({
-        uf: UFS[index],
-        erro:
-          result.reason?.message ||
-          "Falha desconhecida na consulta estadual."
+      listaFalhas.push({
+        uf: UFS[i],
+        erro: resultado.reason?.message || "Erro desconhecido"
       });
-    }
-  });
-
-  const candidateMap = new Map();
-
-  for (const state of states) {
-    for (const candidate of state.candidatos) {
-      const key = candidate.numero;
-
-      const existing = candidateMap.get(key) || {
-        numero: candidate.numero,
-        nome: candidate.nome,
-        votos: 0
-      };
-
-      existing.votos += candidate.votos;
-
-      if (
-        !existing.nome ||
-        existing.nome === existing.numero
-      ) {
-        existing.nome = candidate.nome;
-      }
-
-      candidateMap.set(key, existing);
     }
   }
 
-  const sum = field =>
-    states.reduce(
-      (total, state) =>
-        total + (Number(state[field]) || 0),
+  const somar = campo =>
+    estados.reduce(
+      (total, estado) => total + (Number(estado[campo]) || 0),
       0
     );
 
-  const totalSections = sum("secoesTotal");
-  const countedSections = sum("secoesTotalizadas");
-  const eligibleElectorate = sum("eleitoradoApto");
-  const countedElectorate = sum("eleitoradoTotalizado");
+  const totalSecoes = somar("secoesTotal");
+  const secoesTotalizadas = somar("secoesTotalizadas");
+  const totalEleitores = somar("eleitoradoApto");
+  const eleitoresTotalizados = somar("eleitoradoTotalizado");
 
-  const payload = {
+  const resposta = {
     ok: true,
     fonte: "TSE",
-    eleicao: ELECTION_ID,
+    eleicao: ELEICAO,
     turno: 2,
-
     consultadoEm: new Date().toISOString(),
-    duracaoMs: Date.now() - startedAt,
+    duracaoMs: Date.now() - inicio,
 
-    arquivoNacional: nationalUrl,
-    geracaoNacional: nationalFile?.idg ?? null,
-    nacionalDisponivel: Boolean(nationalFile),
-    erroNacional: nationalError,
+    nacionalDisponivel: Boolean(arquivoNacional),
+    arquivoNacional: urlNacional,
+    geracaoNacional: arquivoNacional?.idg ?? null,
+    erroNacional,
 
     cobertura: {
-      estadosConsultados: states.length,
+      estadosConsultados: estados.length,
       estadosEsperados: 27,
-      coberturaCompleta: states.length === 27,
-      falhas,
+      coberturaCompleta: estados.length === 27,
+      falhas: listaFalhas,
 
-      secoesTotal: totalSections,
-      secoesTotalizadas: countedSections,
-      apuracaoSecoesPct: percent(
-        countedSections,
-        totalSections
+      secoesTotal: totalSecoes,
+      secoesTotalizadas,
+      apuracaoSecoesPct: percentual(
+        secoesTotalizadas,
+        totalSecoes
       ),
 
-      eleitoradoApto: eligibleElectorate,
-      eleitoradoTotalizado: countedElectorate,
-      apuracaoEleitoradoPct: percent(
-        countedElectorate,
-        eligibleElectorate
+      eleitoradoApto: totalEleitores,
+      eleitoradoTotalizado: eleitoresTotalizados,
+      apuracaoEleitoradoPct: percentual(
+        eleitoresTotalizados,
+        totalEleitores
       )
     },
 
-    candidatos: [...candidateMap.values()].sort(
-      (a, b) => b.votos - a.votos
-    ),
-
-    estados: states,
+    estados,
 
     observacao:
-      "Esta rota é um diagnóstico agregado dos arquivos estaduais encontrados. " +
-      "Não representa, por si só, a projeção estatística municipal. " +
-      "Se a cobertura for menor que 27 UFs, os totais são parciais."
+      "Consulta técnica dos arquivos estaduais do TSE. " +
+      "Cobertura incompleta significa que os totais não representam " +
+      "necessariamente todo o Brasil. Esta rota ainda não calcula " +
+      "a projeção estatística municipal."
   };
 
-  CACHE.national = payload;
-  CACHE.nationalAt = Date.now();
+  cache.brasil = resposta;
+  cache.brasilEm = Date.now();
 
   return {
-    ...payload,
+    ...resposta,
     cache: false
   };
 }
@@ -542,13 +359,13 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     servico: "Projeção Brasil — Coletor",
-    eleicao: ELECTION_ID,
+    eleicao: ELEICAO,
     endpoints: [
       "/api/status",
       "/api/brasil",
       "/api/municipios",
       "/api/diagnostico-municipios",
-      "/api/municipio/uf/codigo"
+      "/api/municipio/UF/CODIGO"
     ]
   });
 });
@@ -558,7 +375,7 @@ app.get("/api/status", (_req, res) => {
     ok: true,
     servico: "Projeção Brasil — Coletor",
     fonte: "TSE",
-    eleicao: ELECTION_ID,
+    eleicao: ELEICAO,
     cacheMunicipioSegundos: 45,
     cacheBrasilSegundos: 25,
     horarioServidor: new Date().toISOString()
@@ -567,7 +384,7 @@ app.get("/api/status", (_req, res) => {
 
 app.get("/api/municipios", async (_req, res, next) => {
   try {
-    const config = await getMunicipalityConfig();
+    const config = await obterConfiguracao();
 
     res.json({
       ok: true,
@@ -578,8 +395,8 @@ app.get("/api/municipios", async (_req, res, next) => {
       total: config.municipios.length,
       municipios: config.municipios
     });
-  } catch (error) {
-    next(error);
+  } catch (erro) {
+    next(erro);
   }
 });
 
@@ -587,55 +404,42 @@ app.get(
   "/api/diagnostico-municipios",
   async (_req, res, next) => {
     try {
-      const config = await getMunicipalityConfig();
-      const rows = config.municipios;
+      const config = await obterConfiguracao();
+      const municipios = config.municipios;
 
-      const municipalCodes = rows
-        .map(item => item.codigo)
+      const codigos = municipios
+        .map(m => m.codigo)
         .filter(Boolean);
 
-      const ibgeCodes = rows
-        .map(item => item.ibge)
+      const codigosIBGE = municipios
+        .map(m => m.codigoIBGE)
         .filter(Boolean);
 
-      const uniqueCount = values =>
-        new Set(values).size;
+      const contarUnicos = valores => new Set(valores).size;
 
       res.json({
         ok: true,
         dataConfiguracao: config.data,
         horaConfiguracao: config.hora,
         geracaoConfiguracao: config.geracao,
-
-        registrosOriginais: rows.length,
-
-        codigosMunicipaisUnicos:
-          uniqueCount(municipalCodes),
-
+        registrosOriginais: municipios.length,
+        codigosMunicipaisUnicos: contarUnicos(codigos),
         codigosMunicipaisRepetidos:
-          municipalCodes.length -
-          uniqueCount(municipalCodes),
-
-        codigosIBGEUnicos:
-          uniqueCount(ibgeCodes),
-
+          codigos.length - contarUnicos(codigos),
+        codigosIBGEUnicos: contarUnicos(codigosIBGE),
         codigosIBGERepetidos:
-          ibgeCodes.length -
-          uniqueCount(ibgeCodes),
-
+          codigosIBGE.length - contarUnicos(codigosIBGE),
         registrosSemIBGE:
-          rows.filter(item => !item.ibge).length,
-
+          municipios.filter(m => !m.codigoIBGE).length,
         totalUFs: [
-          ...new Set(rows.map(item => item.uf))
+          ...new Set(municipios.map(m => m.uf))
         ].length,
-
         UFs: [
-          ...new Set(rows.map(item => item.uf))
+          ...new Set(municipios.map(m => m.uf))
         ]
       });
-    } catch (error) {
-      next(error);
+    } catch (erro) {
+      next(erro);
     }
   }
 );
@@ -644,34 +448,88 @@ app.get(
   "/api/municipio/:uf/:codigo",
   async (req, res, next) => {
     try {
-      res.json(
-        await getMunicipalityResult(
-          req.params.uf,
-          req.params.codigo
-        )
+      const uf = String(req.params.uf ?? "")
+        .trim()
+        .toLowerCase();
+
+      const codigo = String(req.params.codigo ?? "")
+        .trim()
+        .padStart(5, "0");
+
+      if (!UFS.includes(uf) || !/^\d{5}$/.test(codigo)) {
+        return res.status(400).json({
+          ok: false,
+          erro: "UF ou código municipal inválido."
+        });
+      }
+
+      const chave = `${uf}/${codigo}`;
+      const armazenado = cache.municipios.get(chave);
+
+      if (
+        armazenado &&
+        Date.now() - armazenado.em < 45000
+      ) {
+        return res.json({
+          ...armazenado.dados,
+          cache: true
+        });
+      }
+
+      const url =
+        `${BASE}/dados/${uf}/${uf}${codigo}-c0001-e${ELEICAO}-u.json`;
+
+      const dados = await buscarJson(url);
+      const config = await obterConfiguracao();
+
+      const municipio = config.municipios.find(
+        m => m.uf === uf && m.codigo === codigo
       );
-    } catch (error) {
-      next(error);
+
+      const resultado = {
+        ok: true,
+        fonte: "TSE",
+        eleicao: ELEICAO,
+        turno: 2,
+        uf,
+        codigo,
+        municipio: municipio?.nome || codigo,
+        codigoIBGE: municipio?.codigoIBGE || null,
+        arquivo: url,
+        consultadoEm: new Date().toISOString(),
+        geracao: dados?.idg ?? null,
+        dados
+      };
+
+      cache.municipios.set(chave, {
+        em: Date.now(),
+        dados: resultado
+      });
+
+      res.json({
+        ...resultado,
+        cache: false
+      });
+    } catch (erro) {
+      next(erro);
     }
   }
 );
 
 app.get("/api/brasil", async (_req, res, next) => {
   try {
-    res.json(await getBrazilSummary());
-  } catch (error) {
-    next(error);
+    res.json(await obterBrasil());
+  } catch (erro) {
+    next(erro);
   }
 });
 
-app.use((error, _req, res, _next) => {
-  const status = error.status || 502;
+app.use((erro, _req, res, _next) => {
+  console.error("Erro no coletor:", erro);
 
-  res.status(status).json({
+  res.status(erro.status || 502).json({
     ok: false,
-    erro:
-      error.message ||
-      "Falha inesperada no coletor.",
+    erro: erro.message || "Falha inesperada no coletor.",
     horarioServidor: new Date().toISOString()
   });
 });
