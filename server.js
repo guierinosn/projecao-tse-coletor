@@ -298,6 +298,59 @@ app.get("/api/diagnostico-municipios", async (req, res) => {
     });
   }
 });
+app.get("/api/diagnostico-municipios", async (req, res) => {
+  try {
+    const config = await obterConfiguracao();
+    const porCodigo = new Set();
+    const porIBGE = new Set();
+    const porUF = new Set();
+    let semIBGE = 0;
+    let registros = 0;
+    let codigosRepetidos = 0;
+    let ibgeRepetidos = 0;
+
+    for (const estado of config.abr) {
+      const uf = String(estado.cd || "").trim().toLowerCase();
+      if (uf) porUF.add(uf);
+
+      for (const municipio of estado.mu || []) {
+        registros++;
+
+        const codigo = normalizarCodigo(municipio.cd);
+        const chave = `${uf}-${codigo}`;
+        const ibge = String(municipio.cdi || "").trim();
+
+        if (porCodigo.has(chave)) codigosRepetidos++;
+        porCodigo.add(chave);
+
+        if (!ibge) {
+          semIBGE++;
+        } else {
+          if (porIBGE.has(ibge)) ibgeRepetidos++;
+          porIBGE.add(ibge);
+        }
+      }
+    }
+
+    res.json({
+      ok: true,
+      registrosOriginais: registros,
+      codigosMunicipaisUnicos: porCodigo.size,
+      codigosMunicipaisRepetidos: codigosRepetidos,
+      codigosIBGEUnicos: porIBGE.size,
+      codigosIBGERepetidos: ibgeRepetidos,
+      registrosSemIBGE: semIBGE,
+      totalUFs: porUF.size,
+      UFs: [...porUF].sort()
+    });
+  } catch (erro) {
+    res.status(502).json({
+      ok: false,
+      erro: String(erro)
+    });
+  }
+});
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Servidor ativo na porta ${PORT}`);
 });
